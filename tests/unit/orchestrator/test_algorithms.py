@@ -8,7 +8,7 @@ from verifiers.v1.graph import MessageNode
 from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
-from prime_rl.orchestrator.algo import EchoAlgorithm, assign_advantages, stamp_loss_routing
+from prime_rl.orchestrator.algo import EchoAlgorithm, OPDAlgorithm, assign_advantages, stamp_loss_routing
 from prime_rl.orchestrator.algo.base import iter_trainable_traces
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.transports.batch.types import TrainingSample
@@ -514,3 +514,45 @@ def test_echo_filter_narrows_selection():
     episode = _two_turn_episode()
     with pytest.raises(ValueError, match="span the branch's tokens"):
         asyncio.run(_echo_algorithm(filter_fn=lambda trace: [[True] * 6]).score_episode(episode))
+
+
+# --------------------------------------------------------------------------
+# OPD: the teacher prefill-scores each sample, optionally after a
+# teacher-only context block the policy never sees.
+# --------------------------------------------------------------------------
+
+
+class _Teacher:
+    """Prefill-scores token ids: each token's logprob is minus its id."""
+
+    def __init__(self):
+        self.scored: list[list[int]] = []
+
+    async def score(self, token_ids: list[int]) -> list[float]:
+        self.scored.append(token_ids)
+        return [-float(token_id) for token_id in token_ids]
+
+
+def _opd_reference(context_ids: list[int], **kwargs) -> tuple[_Teacher, list[float]]:
+    # Reference scoring only reads clean episodes.
+    episode = _two_turn_episode().model_copy(update={"ok": True})
+    algo = OPDAlgorithm(_build(type="opd", teacher=FROZEN, **kwargs), MagicMock())
+    algo.teacher_clients = _Teacher()
+    algo.context_ids = context_ids
+    asyncio.run(algo.score_episode(episode))
+    sample = trace_to_samples(episode.traces[0])[0]
+    return algo.teacher_clients, [value for value, sampled in zip(sample.ref_logprobs, sample.mask) if sampled]
+
+
+def test_opd_scores_each_sample_as_it_is():
+    teacher, reference = _opd_reference([])
+    assert teacher.scored == [[1, 2, 3, 4, 5, 6, 7, 8]]
+    assert reference == [-3.0, -4.0, -7.0, -8.0]
+
+
+def test_opd_teacher_context_is_read_by_the_teacher_but_not_assigned():
+    # The teacher reads the context block [91, 92] before the sample; the
+    # reference stays aligned to the sample's own sampled tokens.
+    teacher, reference = _opd_reference([91, 92], teacher_context="Give up when you are blocked.")
+    assert teacher.scored == [[91, 92, 1, 2, 3, 4, 5, 6, 7, 8]]
+    assert reference == [-3.0, -4.0, -7.0, -8.0]

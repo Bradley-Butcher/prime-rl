@@ -22,15 +22,29 @@ class OPDAlgorithm(Algorithm):
     context is prefill-scored under the teacher (``ref_logprobs`` on the
     wire), and the trainer evaluates the KL against the live policy. No
     credit is assigned — rollouts keep ``advantages=None`` and samples ship no
-    advantage stream; ``group_size`` only fans out sampling."""
+    advantage stream; ``group_size`` only fans out sampling.
+
+    With ``teacher_context``, the teacher reads that system message before
+    each sample, and the logprobs over the sample's own tokens become the
+    reference (on-policy context distillation)."""
 
     def __init__(self, config: OPDAlgoConfig, clients: InferenceClient):
         super().__init__(config, clients)
         self.teacher = config.teacher
+        self.teacher_context = config.teacher_context
+        self.renderer_config = config.renderer
         self.teacher_clients: InferenceClient | None = None  # frozen teacher endpoint, connected in setup()
+        self.context_ids: list[int] = []  # the rendered teacher_context block, built in setup()
 
     async def setup(self) -> None:
         self.teacher_clients = await self.connect(self.teacher)
+        if self.teacher_context is not None:
+            from renderers.base import create_renderer, load_tokenizer
+
+            renderer = create_renderer(load_tokenizer(self.clients.model_name), self.renderer_config)
+            self.context_ids = renderer.render_ids(
+                [{"role": "system", "content": self.teacher_context}], add_generation_prompt=False
+            )
 
     async def score_episode(self, episode: vf.Episode) -> None:
         teacher = self.teacher_clients
@@ -40,6 +54,7 @@ class OPDAlgorithm(Algorithm):
             for _, trace in iter_trainable_traces([episode], self.drop_truncated)
             for branch, _ in iter_trainable_branches(trace)
         ]
-        scores = await asyncio.gather(*(teacher.score(branch.token_ids) for branch in branches))
+        context = self.context_ids
+        scores = await asyncio.gather(*(teacher.score(context + branch.token_ids) for branch in branches))
         for branch, logprobs in zip(branches, scores, strict=True):
-            assign_reference_logprobs(branch, logprobs)
+            assign_reference_logprobs(branch, logprobs[len(context) :])

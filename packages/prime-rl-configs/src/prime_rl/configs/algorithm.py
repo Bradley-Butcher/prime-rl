@@ -320,6 +320,21 @@ class OPDAlgoConfig(BaseAlgoConfig):
     ``"policy"`` is not even representable here (use ``opsd`` for
     demo-conditioned self-teaching)."""
 
+    teacher_context: str | None = None
+    """Teacher-only context (on-policy context distillation,
+    https://arxiv.org/abs/2602.12275): a system message the teacher reads
+    before each sample when scoring it, which the policy never sees — e.g. a
+    system prompt whose behaviour the policy should learn as its default.
+    Prepended to the sample's token ids and scored verbatim, as ``opsd``
+    prepends its demonstration. None scores each sample as it is."""
+
+    renderer: RendererConfig = AutoRendererConfig()
+    """Renderer family for the ``teacher_context`` block, built on the
+    policy's tokenizer: the teacher scores the policy's own token ids, so the
+    two share one. Defaults to ``"auto"`` (resolved from the policy
+    tokenizer); set explicitly to match a non-auto policy renderer. Unused
+    without ``teacher_context``."""
+
 
 class OPSDAlgoConfig(BaseAlgoConfig):
     type: Literal["opsd"] = "opsd"
