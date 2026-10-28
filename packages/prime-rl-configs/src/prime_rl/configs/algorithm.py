@@ -169,6 +169,15 @@ class BaseAlgoConfig(BaseConfig):
     sampling: SamplingConfig = SamplingConfig()
     """Sampling component: which model generates train rollouts."""
 
+    drop_truncated: bool = False
+    """Leave out of training every trace a turn or token limit cut off
+    (``Trace.is_truncated``: ``max_turns``, a token limit, failed compaction, or
+    a length-finished response), as DAPO's overlong filtering does
+    (https://arxiv.org/abs/2503.14476). A run cut off before it ends teaches
+    only its middle: under a turn cap the policy is trained on long runs that
+    never finish, and learns to keep going. A cohort algorithm still scores
+    such traces with their group; they only ship no samples."""
+
     @model_validator(mode="after")
     def validate_sampling_source(self):
         """The on-policy loss types (rl, ref_kl) need the live policy's own

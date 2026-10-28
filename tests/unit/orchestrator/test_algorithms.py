@@ -229,6 +229,21 @@ def test_trainable_traces_exclude_failed_episodes_without_changing_verdicts(fail
     assert failed.model_dump() == before
 
 
+@pytest.mark.parametrize("stop", ["max_turns", "max_total_tokens", "compaction_failed", "agent_completed"])
+def test_drop_truncated_leaves_out_only_traces_a_limit_cut_off(stop):
+    episode = _make_episode()
+    episode.traces[0].stop_condition = stop
+    whole = [(episode, episode.traces[0])]
+
+    assert list(iter_trainable_traces([episode])) == whole
+    assert list(iter_trainable_traces([episode], drop_truncated=True)) == (whole if stop == "agent_completed" else [])
+
+
+def test_drop_truncated_is_off_by_default_and_set_per_algorithm():
+    assert _build(type="grpo").drop_truncated is False
+    assert _build(type="opd", teacher=FROZEN, drop_truncated=True).drop_truncated is True
+
+
 def test_assign_advantages_full_length_stream():
     # The advantage stream is full-length-N: 0.0 on prompt + non-trainable
     # positions, the rl credit on trainable (mask True) tokens.

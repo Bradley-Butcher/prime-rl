@@ -36,7 +36,9 @@ class OPDAlgorithm(Algorithm):
         teacher = self.teacher_clients
         assert teacher is not None, "teacher not connected — Algorithm.setup() must run first"
         branches = [
-            branch for _, trace in iter_trainable_traces([episode]) for branch, _ in iter_trainable_branches(trace)
+            branch
+            for _, trace in iter_trainable_traces([episode], self.drop_truncated)
+            for branch, _ in iter_trainable_branches(trace)
         ]
         scores = await asyncio.gather(*(teacher.score(branch.token_ids) for branch in branches))
         for branch, logprobs in zip(branches, scores, strict=True):
