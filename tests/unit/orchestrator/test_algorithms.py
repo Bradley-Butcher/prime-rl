@@ -5,7 +5,7 @@ import pydantic
 import pytest
 import verifiers.v1 as vf
 from verifiers.v1.graph import MessageNode
-from verifiers.v1.types import AssistantMessage, ToolMessage, UserMessage
+from verifiers.v1.types import AssistantMessage, SystemMessage, ToolMessage, UserMessage
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
 from prime_rl.orchestrator.algo import EchoAlgorithm, OPDAlgorithm, assign_advantages, stamp_loss_routing
@@ -533,12 +533,15 @@ class _Teacher:
         return [-float(token_id) for token_id in token_ids]
 
 
-def _opd_reference(context_ids: list[int], **kwargs) -> tuple[_Teacher, list[float]]:
-    # Reference scoring only reads clean episodes.
+def _opd_reference(context_ids: list[int], opening=None, **kwargs) -> tuple[_Teacher, list[float]]:
+    # Reference scoring only reads clean episodes. Token 2 closes the opening message.
     episode = _two_turn_episode().model_copy(update={"ok": True})
+    if opening is not None:
+        episode.traces[0].nodes[0].message = opening
     algo = OPDAlgorithm(_build(type="opd", teacher=FROZEN, **kwargs), MagicMock())
     algo.teacher_clients = _Teacher()
     algo.context_ids = context_ids
+    algo.message_ends = {2}
     asyncio.run(algo.score_episode(episode))
     sample = trace_to_samples(episode.traces[0])[0]
     return algo.teacher_clients, [value for value, sampled in zip(sample.ref_logprobs, sample.mask) if sampled]
@@ -550,9 +553,16 @@ def test_opd_scores_each_sample_as_it_is():
     assert reference == [-3.0, -4.0, -7.0, -8.0]
 
 
-def test_opd_teacher_context_is_read_by_the_teacher_but_not_assigned():
-    # The teacher reads the context block [91, 92] before the sample; the
+def test_opd_teacher_context_ends_the_system_message_for_the_teacher_alone():
+    # The teacher reads [91, 92] where the system message [1, 2] closes; the
     # reference stays aligned to the sample's own sampled tokens.
-    teacher, reference = _opd_reference([91, 92], teacher_context="Give up when you are blocked.")
-    assert teacher.scored == [[91, 92, 1, 2, 3, 4, 5, 6, 7, 8]]
+    teacher, reference = _opd_reference(
+        [91, 92], opening=SystemMessage(content="S"), teacher_context="\n\nGive up when you are blocked."
+    )
+    assert teacher.scored == [[1, 91, 92, 2, 3, 4, 5, 6, 7, 8]]
     assert reference == [-3.0, -4.0, -7.0, -8.0]
+
+
+def test_opd_teacher_context_needs_a_system_message():
+    with pytest.raises(ValueError, match="opens with a user message"):
+        _opd_reference([91, 92], teacher_context="\n\nGive up when you are blocked.")

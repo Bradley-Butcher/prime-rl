@@ -322,18 +322,19 @@ class OPDAlgoConfig(BaseAlgoConfig):
 
     teacher_context: str | None = None
     """Teacher-only context (on-policy context distillation,
-    https://arxiv.org/abs/2602.12275): a system message the teacher reads
-    before each sample when scoring it, which the policy never sees — e.g. a
-    system prompt whose behaviour the policy should learn as its default.
-    Prepended to the sample's token ids and scored verbatim, as ``opsd``
-    prepends its demonstration. None scores each sample as it is."""
+    https://arxiv.org/abs/2602.12275): text appended to each sample's system
+    message when the teacher scores it, which the policy never sees — e.g.
+    instructions whose behaviour the policy should learn as its default. It is
+    inserted as written just before the system message closes, so it carries
+    its own separator (a leading blank line, say). A sample that does not open
+    with a system message fails. None scores each sample as it is."""
 
     renderer: RendererConfig = AutoRendererConfig()
-    """Renderer family for the ``teacher_context`` block, built on the
-    policy's tokenizer: the teacher scores the policy's own token ids, so the
-    two share one. Defaults to ``"auto"`` (resolved from the policy
-    tokenizer); set explicitly to match a non-auto policy renderer. Unused
-    without ``teacher_context``."""
+    """Renderer family whose end-of-message token closes the system message
+    ``teacher_context`` is appended to, built on the policy's tokenizer: the
+    teacher scores the policy's own token ids, so the two share one. Defaults
+    to ``"auto"`` (resolved from the policy tokenizer); set explicitly to match
+    a non-auto policy renderer. Unused without ``teacher_context``."""
 
 
 class OPSDAlgoConfig(BaseAlgoConfig):

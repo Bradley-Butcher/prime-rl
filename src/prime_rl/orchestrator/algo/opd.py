@@ -24,9 +24,9 @@ class OPDAlgorithm(Algorithm):
     credit is assigned — rollouts keep ``advantages=None`` and samples ship no
     advantage stream; ``group_size`` only fans out sampling.
 
-    With ``teacher_context``, the teacher reads that system message before
-    each sample, and the logprobs over the sample's own tokens become the
-    reference (on-policy context distillation)."""
+    With ``teacher_context``, the teacher reads that text at the end of each
+    sample's system message, and the logprobs over the sample's own tokens
+    become the reference (on-policy context distillation)."""
 
     def __init__(self, config: OPDAlgoConfig, clients: InferenceClient):
         super().__init__(config, clients)
@@ -34,17 +34,32 @@ class OPDAlgorithm(Algorithm):
         self.teacher_context = config.teacher_context
         self.renderer_config = config.renderer
         self.teacher_clients: InferenceClient | None = None  # frozen teacher endpoint, connected in setup()
-        self.context_ids: list[int] = []  # the rendered teacher_context block, built in setup()
+        self.context_ids: list[int] = []  # teacher_context on the policy's tokenizer, built in setup()
+        self.message_ends: set[int] = set()  # the renderer's end-of-message tokens, built in setup()
 
     async def setup(self) -> None:
         self.teacher_clients = await self.connect(self.teacher)
         if self.teacher_context is not None:
             from renderers.base import create_renderer, load_tokenizer
 
-            renderer = create_renderer(load_tokenizer(self.clients.model_name), self.renderer_config)
-            self.context_ids = renderer.render_ids(
-                [{"role": "system", "content": self.teacher_context}], add_generation_prompt=False
+            tokenizer = load_tokenizer(self.clients.model_name)
+            self.context_ids = tokenizer.encode(self.teacher_context, add_special_tokens=False)
+            self.message_ends = set(create_renderer(tokenizer, self.renderer_config).get_stop_token_ids())
+
+    def context_at(self, branch: vf.Branch) -> int | None:
+        """Where ``teacher_context`` goes in the branch's tokens: at the token
+        that closes its system message. None without a context."""
+        if not self.context_ids:
+            return None
+        system = branch.nodes[0]
+        if system.message.role != "system":
+            raise ValueError(
+                f"teacher_context: the sample opens with a {system.message.role} message, not a system one"
             )
+        closes = [index for index, token in enumerate(system.token_ids) if token in self.message_ends]
+        if not closes:
+            raise ValueError("teacher_context: the sample's system message has no end-of-message token")
+        return closes[-1]
 
     async def score_episode(self, episode: vf.Episode) -> None:
         teacher = self.teacher_clients
@@ -55,6 +70,15 @@ class OPDAlgorithm(Algorithm):
             for branch, _ in iter_trainable_branches(trace)
         ]
         context = self.context_ids
-        scores = await asyncio.gather(*(teacher.score(context + branch.token_ids) for branch in branches))
-        for branch, logprobs in zip(branches, scores, strict=True):
-            assign_reference_logprobs(branch, logprobs[len(context) :])
+        places = [self.context_at(branch) for branch in branches]
+        scores = await asyncio.gather(
+            *(
+                teacher.score(
+                    branch.token_ids if at is None else branch.token_ids[:at] + context + branch.token_ids[at:]
+                )
+                for branch, at in zip(branches, places, strict=True)
+            )
+        )
+        for branch, at, logprobs in zip(branches, places, scores, strict=True):
+            # Every token before the context is the sample's own, scored on the same prefix; drop only the context's.
+            assign_reference_logprobs(branch, logprobs if at is None else logprobs[:at] + logprobs[at + len(context) :])
