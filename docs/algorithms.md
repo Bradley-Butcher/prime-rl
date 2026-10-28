@@ -76,6 +76,8 @@ type = "grpo"  # the default
 | `opsd` | policy | `ref_kl` on actions | SDFT ([arXiv:2601.19897](https://arxiv.org/abs/2601.19897)): the model is its own reference, conditioned on an expert demonstration. The teacher *is* the live policy (the paper's setting, no extra deployment) — no model to configure. |
 | `echo` | policy | `rl` on actions + weighted `ce` on observations | ECHO: standard GRPO plus a cross-entropy loss on env-provided tokens already present in the rollout, selected by message role (needs the renderer's role attribution). Defaults to tool-response bodies at `alpha = 0.1` (ECHO's λ); set `roles` to train other roles, each at its own weight. |
 
+Every algorithm takes `drop_truncated = true` to ship no samples from a trace a turn or token limit cut off (`Trace.is_truncated`), as DAPO's overlong filtering does. A run cut off before it ends teaches only its middle, where continuing is right; under a turn cap the policy otherwise learns from long runs that never finish. A cohort algorithm still scores such traces with their group.
+
 ### Customizing Components
 
 Every key beyond `type` is visibly your own assembly — there is no preset layer to diverge from. The vetted setting is the class defaults; what you set is what runs:

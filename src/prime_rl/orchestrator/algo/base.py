@@ -9,8 +9,9 @@ from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
 from prime_rl.orchestrator.clients import InferenceClient, connect_frozen_client
 
 
-def iter_trainable_traces(episodes: list[vf.Episode]):
-    """Yield clean, kept, trainable traces that contain sampled tokens."""
+def iter_trainable_traces(episodes: list[vf.Episode], drop_truncated: bool = False):
+    """Yield clean, kept, trainable traces that contain sampled tokens; with ``drop_truncated``, none that a turn or
+    token limit cut off (``Trace.is_truncated``)."""
     for episode in episodes:
         for trace in episode.traces:
             if (
@@ -20,6 +21,8 @@ def iter_trainable_traces(episodes: list[vf.Episode]):
                 or not trace.agent.trainable
                 or trace.num_turns == 0
             ):
+                continue
+            if drop_truncated and trace.is_truncated:
                 continue
             if any(np.any(node.mask) for node in trace.nodes):
                 yield episode, trace
@@ -35,6 +38,7 @@ class Algorithm:
 
     def __init__(self, config: AlgoConfig, clients: InferenceClient):
         self.action_loss_type = config.action_loss_type
+        self.drop_truncated = config.drop_truncated
         self.clients = clients
         self.connected: InferenceClient | None = None
 

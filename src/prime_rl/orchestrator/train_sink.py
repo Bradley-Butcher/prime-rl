@@ -347,7 +347,7 @@ class TrainSink(Reconfigurable):
             )
             return
 
-        survivors = [trace for _, trace in iter_trainable_traces(group)]
+        survivors = [trace for _, trace in iter_trainable_traces(group, env.algorithm.drop_truncated)]
         if survivors:
             await env.algorithm.score_group(group)
         admitted = self._admit(group) if group else False

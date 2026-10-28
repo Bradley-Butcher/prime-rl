@@ -163,6 +163,15 @@ class BaseAlgoConfig(BaseConfig):
 
     action_loss_type: ClassVar[ActionLossType] = "rl"
 
+    drop_truncated: bool = False
+    """Leave out of training every trace a turn or token limit cut off
+    (``Trace.is_truncated``: ``max_turns``, a token limit, failed compaction, or
+    a length-finished response), as DAPO's overlong filtering does
+    (https://arxiv.org/abs/2503.14476). A run cut off before it ends teaches
+    only its middle: under a turn cap the policy is trained on long runs that
+    never finish, and learns to keep going. A cohort algorithm still scores
+    such traces with their group; they only ship no samples."""
+
     @property
     def rollout_model(self) -> ModelReference:
         """The model that generates train rollouts. The on-policy loss types
