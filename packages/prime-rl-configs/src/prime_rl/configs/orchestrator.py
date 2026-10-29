@@ -286,6 +286,10 @@ class OnlineEvalSourceConfig(EvalSourceConfig):
     interval: int = Field(100, ge=1)
     """Step interval at which to evaluate this env."""
 
+    steps: list[Annotated[int, Field(ge=1)]] = Field(default_factory=list)
+    """Further steps at which to evaluate this env, besides every ``interval``: ``interval = 30`` with
+    ``steps = [10, 20]`` evaluates at 10, 20, 30, 60, 90 and so on."""
+
 
 class SourceGroupConfig(BaseConfig):
     """A list of sources plus defaults for them.
@@ -416,6 +420,11 @@ class ScheduledEvalConfig(EvalSourcesConfig):
     def intervals(self) -> dict[str, int]:
         """Step interval per eval env, by resolved name."""
         return {source.resolved_name: source.interval for source in self.source}
+
+    @property
+    def extra_steps(self) -> dict[str, frozenset[int]]:
+        """Further eval steps per eval env, besides its interval, by resolved name."""
+        return {source.resolved_name: frozenset(source.steps) for source in self.source}
 
 
 class RLOnlineEvalConfig(ScheduledEvalConfig):

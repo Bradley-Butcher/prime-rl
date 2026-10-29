@@ -29,20 +29,24 @@ class EvalSource:
         eval_envs: EvalEnvs,
         *,
         intervals: dict[str, int] | None = None,
+        extra_steps: dict[str, frozenset[int]] | None = None,
         skip_first_step: bool = False,
         is_resumed: bool = False,
     ) -> None:
         """``intervals`` is the step interval per env of a training run's online evals;
-        a standalone eval has none and fires every env on its one trigger."""
+        a standalone eval has none and fires every env on its one trigger. ``extra_steps`` are further
+        steps per env at which it fires besides its interval."""
         self.skip_first_step = skip_first_step
 
         self.tasks_by_env: dict[str, list[vf.Task]] = {}
         self.group_sizes: dict[str, int] = {}
         self.intervals: dict[str, int] = {}
+        self.extra_steps: dict[str, frozenset[int]] = {}
         for env in eval_envs:
             self.tasks_by_env[env.name] = list(env.examples)
             self.group_sizes[env.name] = env.config.group_size
             self.intervals[env.name] = intervals[env.name] if intervals is not None else 1
+            self.extra_steps[env.name] = (extra_steps or {}).get(env.name, frozenset())
 
         self.queue: deque[TaskRequest] = deque()
 
@@ -63,7 +67,7 @@ class EvalSource:
         fired = [
             name
             for name, interval in self.intervals.items()
-            if (is_first or force or step % interval == 0) and self.tasks_by_env[name]
+            if (is_first or force or step % interval == 0 or step in self.extra_steps[name]) and self.tasks_by_env[name]
         ]
         saved: dict[str, list[vf.WireEpisode]] = defaultdict(list)
         for episode in completed:

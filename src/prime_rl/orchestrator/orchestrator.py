@@ -328,6 +328,7 @@ class Orchestrator:
             EvalSource(
                 self.eval_envs,
                 intervals=config.eval.intervals,
+                extra_steps=config.eval.extra_steps,
                 skip_first_step=config.eval.skip_first_step,
                 is_resumed=self.resume_step is not None,
             )

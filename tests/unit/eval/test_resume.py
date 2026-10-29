@@ -251,3 +251,21 @@ def test_take_landed_checks_source_order_and_shared_defaults(tmp_path, reorder) 
     resume.stamp_config(tmp_path, saved.model_dump(mode="json"))
     with pytest.raises(ValueError, match=rf"in \[{changed}\].*--resume.skip-checks"):
         resume.take_landed(tmp_path, current)
+
+
+def test_extra_steps_fire_besides_the_interval() -> None:
+    source = EvalSource(
+        [_env("main", ["m0"]), _env("vendors", ["v0"])],
+        intervals={"main": 10, "vendors": 30},
+        extra_steps={"vendors": frozenset({10, 20})},
+    )
+    fired = {step: source.trigger(step)[0] for step in (0, 10, 20, 30, 40, 50, 60)}
+    assert fired == {
+        0: ["main", "vendors"],
+        10: ["main", "vendors"],
+        20: ["main", "vendors"],
+        30: ["main", "vendors"],
+        40: ["main"],
+        50: ["main"],
+        60: ["main", "vendors"],
+    }
