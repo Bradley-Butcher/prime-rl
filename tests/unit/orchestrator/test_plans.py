@@ -100,10 +100,32 @@ def test_task_list_dispatches_in_order_then_samples(tmp_path):
     ]
 
 
+def test_named_sources_get_their_share_and_the_rest_keep_their_ratios(tmp_path):
+    names, ratios = ["A", "B", "C"], [0.5, 0.3, 0.2]
+    envs = [
+        SimpleNamespace(
+            name=name,
+            tasks=iter([vf.Task(vf.WireTaskData(idx=0, prompt=name))]),
+            num_tasks=1,
+            config=SimpleNamespace(ratio=ratio, curriculum=None),
+        )
+        for name, ratio in zip(names, ratios)
+    ]
+    source = TrainSource(envs)
+    source.plans = Plans(source, tmp_path, resume_step=None)
+
+    assert source.plans.set(2, Plan(sources={"A": 0.2}))["shares"] == {"A": 0.2, "B": 0.48, "C": 0.32}
+    # Each step's plan is relative to the config, not to an earlier step's plan.
+    assert source.plans.set(3, Plan(sources={"B": 0.1}))["shares"] == {"A": 0.6429, "B": 0.1, "C": 0.2571}
+    assert source.plans.set(4, Plan(sources={"A": 0.6, "B": 0.4}))["shares"] == {"A": 0.6, "B": 0.4, "C": 0.0}
+    counts = Counter(env for env, _ in draws(source, 2, 5000))
+    assert abs(counts["A"] / 5000 - 0.2) < 0.03 and abs(counts["B"] / 5000 - 0.48) < 0.03
+
+
 def test_sources_apply_to_their_step_only(tmp_path):
     source = planned_source(tmp_path)
     source.plans.set(2, Plan(sources={"a": 1.0}))
-    source.plans.set(4, Plan(sources={"a": 0.0, "others": 1.0}))
+    source.plans.set(4, Plan(sources={"a": 0.0}))
 
     envs = {step: {env for env, _ in draws(source, step, 40)} for step in (1, 2, 3, 4)}
 
@@ -145,7 +167,10 @@ def test_validation_rejects_unknown_names_and_passed_steps(tmp_path):
         Plan(tasks=[PlanTask(env="c", key="x")]),
         Plan(tasks=[PlanTask(env="a", key="missing")]),
         Plan(sources={"c": 1.0}),
-        Plan(sources={"a": 0.0}),
+        Plan(sources={"others": 1.0}),
+        Plan(sources={"a": 0.7, "b": 0.6}),
+        Plan(sources={"a": 0.2, "b": 0.3}),
+        Plan(sources={"a": 1.0}, weights={"label:kind=write": 0.0, "label:kind=read": 0.0}),
         Plan(weights={"task:missing": 2.0}),
         Plan(weights={"label:slow": 2.0}),
         Plan(weights={"pool:medium": 2.0}),
@@ -157,7 +182,7 @@ def test_validation_rejects_unknown_names_and_passed_steps(tmp_path):
     with pytest.raises(ValidationError):
         Plan(weights={"label:fast": -1.0})
     with pytest.raises(ValidationError):
-        Plan(sources={"a": float("inf")})
+        Plan(sources={"a": 1.5})
 
     plan = Plan(sources={"a": 1.0})
     plans.set(3, plan)
@@ -220,7 +245,15 @@ def test_plan_routes(tmp_path):
     assert response.status_code == 200
     stored = response.json()
     assert stored.pop("posted_at")
-    assert stored == {"step": 2, "id": 1, "plan": plan, "state": "pending", "author": "claude", "note": "retry a0"}
+    assert stored == {
+        "step": 2,
+        "id": 1,
+        "plan": plan,
+        "shares": {"a": 0.25, "b": 0.75},
+        "state": "pending",
+        "author": "claude",
+        "note": "retry a0",
+    }
     assert client.post("/v1/plans", json={"step": "default", "plan": {"sources": {"b": 1.0}}}).status_code == 200
     for invalid in ({"tasks": [{"env": "a", "key": "missing"}]}, {"weights": {"label:fast": -1}}, {"extra": 1}):
         assert client.post("/v1/plans", json={"step": 3, "plan": invalid}).status_code == 422

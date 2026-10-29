@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from prime_rl.orchestrator.train_source import TrainSource
 
 Weight = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+Share = Annotated[float, Field(ge=0, le=1)]
 PlanKey = Annotated[int, Field(ge=1)] | Literal["default"]
 """A plan's step, or ``"default"`` for every step without a plan of its own."""
 RequestedStep = PlanKey | Literal["next"]
@@ -59,8 +60,10 @@ class Plan(BaseModel):
     tasks: list[PlanTask] | None = None
     """Tasks dispatched in order, one per group, from the step's first group; after them the step samples."""
 
-    sources: dict[str, Weight] | None = None
-    """Env weights in place of the configured ratios. An env it leaves out gets ``"others"``, else 0."""
+    sources: dict[str, Share] | None = None
+    """Shares of the step's groups by env. A named env gets exactly its share; the rest of 1 goes to the
+    envs it leaves out by their configured ratios, so nothing if the named shares sum to 1. Relative to the
+    config, never to another step's plan."""
 
     weights: dict[str, Weight] | None = None
     """Multipliers on a Task's weight within its env, keyed ``task:<key>``, ``label:<label>`` or
@@ -104,6 +107,18 @@ class PlanConflictError(Exception):
 
 class PlanNotFoundError(Exception):
     pass
+
+
+SHARE_TOLERANCE = 1e-9
+
+
+def source_shares(names: list[str], ratios: list[float], shares: dict[str, float]) -> list[float]:
+    """Each env's share of a step: a named env's as given, and the rest of 1 split among the others by their
+    configured ratios."""
+    rest = 1.0 - sum(shares.values())
+    unnamed = sum(ratio for name, ratio in zip(names, ratios) if name not in shares)
+    scale = rest / unnamed if rest > SHARE_TOLERANCE and unnamed else 0.0
+    return [shares[name] if name in shares else ratio * scale for name, ratio in zip(names, ratios)]
 
 
 def has_label(task: vf.Task, label: str) -> bool:
@@ -296,6 +311,7 @@ class Plans:
                 step=key,
                 requested=requested,
                 plan=plan.model_dump(mode="json", exclude_none=True),
+                shares=self.shares(plan),
                 author=author,
                 note=note,
                 replaces=previous.id if previous is not None else None,
@@ -320,6 +336,15 @@ class Plans:
             keys = sorted(self.plans, key=lambda key: (key != "default", key if key != "default" else 0))
             return [self._describe(key, self.plans[key]) for key in keys]
 
+    def shares(self, plan: Plan) -> dict[str, float]:
+        """The share of a step's sampled groups each env gets under ``plan``, from the configured ratios, its
+        ``sources``, and its ``weights`` where they exclude an env's every Task."""
+        weights = self._resolve(0, "step", None, plan).env_weights
+        if not any(weights):
+            weights = self.source.weights
+        total = sum(weights)
+        return {name: round(weight / total, 4) for name, weight in zip(self.source.env_names, weights)}
+
     def validate(self, plan: Plan) -> None:
         """Raise ``PlanError`` unless every env, Task, label and pool the plan names is the run's."""
         if not plan.tasks and plan.sources is None and not plan.weights:
@@ -332,9 +357,15 @@ class Plans:
                 raise PlanError(f"Env {item.env!r} streams its Tasks, so a plan cannot list them")
             if item.key not in self.tasks[item.env]:
                 raise PlanError(f"Env {item.env!r} has no Task {item.key!r}")
-        unknown = sorted(set(plan.sources or {}) - {*names, "others"})
+        unknown = sorted(set(plan.sources or {}) - set(names))
         if unknown:
             raise PlanError(f"No env {', '.join(map(repr, unknown))}; the envs are {', '.join(names)}")
+        if plan.sources is not None:
+            total = sum(plan.sources.values())
+            if total > 1 + SHARE_TOLERANCE:
+                raise PlanError(f"The sources' shares sum to {total:g}, more than 1")
+            if set(plan.sources) == set(names) and total < 1 - SHARE_TOLERANCE:
+                raise PlanError(f"The sources name every env, so their shares sum to 1, not {total:g}")
         for selector in plan.weights or {}:
             kind, _, value = selector.partition(":")
             if kind == "task":
@@ -495,8 +526,7 @@ class Plans:
         if plan.sources is None:
             weights = list(self.source.weights)
         else:
-            others = plan.sources.get("others", 0.0)
-            weights = [plan.sources.get(name, others) for name in names]
+            weights = source_shares(names, self.source.weights, plan.sources)
         # An env whose every Task the multipliers exclude is out of the step.
         resolved.env_weights = [
             0.0 if name in resolved.multipliers and not any(resolved.multipliers[name]) else weight
@@ -576,6 +606,7 @@ class Plans:
             "step": key,
             "id": stored.id,
             "plan": stored.plan.model_dump(mode="json", exclude_none=True),
+            "shares": self.shares(stored.plan),
             "state": state,
             "posted_at": stored.posted_at,
             "author": stored.author,
