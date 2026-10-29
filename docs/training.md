@@ -369,8 +369,11 @@ curl -X POST localhost:8041/v1/plans -H 'content-type: application/json' \
   -d '{"step": "next", "author": "me", "note": "drill the write tasks", "plan": {"sources": {"fineract": 2, "others": 1}, "weights": {"label:kind=write": 3, "pool:easy": 0}}}'
 curl localhost:8041/v1/plans            # every plan; GET or DELETE /v1/plans/{step|default} for one
 curl localhost:8041/v1/status           # dispatch step, trainer step, rollouts in flight, steps that used plans
-curl 'localhost:8041/v1/stats?step=12&env=fineract&limit=20'   # per env and per Task; no step for the run's totals
+curl 'localhost:8041/v1/stats?step=12&env=fineract&limit=20'   # per env, label and Task; no step for the run's totals
+curl 'localhost:8041/v1/stats?label=hard&label=hops:1'          # those labels' groups, and the Tasks carrying both
 ```
+
+`/v1/stats` lists each Task with its labels, and aggregates groups, mixed-outcome share and mean reward per label across envs: for the labels named with `label=`, else the `top_labels` (default 20) with the most groups.
 
 The orchestrator records its curriculum under `<output_dir>/curriculum/`, with or without the API: `plans.jsonl` holds every plan posted or deleted with its time, author and note; `dispatch.jsonl` holds every dispatched Task with its step and what chose it (its plan's id, or `null` for the configured sampler), plus a summary line per step; `groups.jsonl` holds every finalized group's outcome, which the stats are built from. A resume reads them back up to its step.
 
