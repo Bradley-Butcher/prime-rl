@@ -24,7 +24,7 @@ import asyncio
 import os
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import verifiers.v1 as vf
 from verifiers.v1.runtimes import set_base_sandbox_labels
@@ -38,6 +38,7 @@ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before tr
 from prime_rl import monitors
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.control.controller import Controller
+from prime_rl.control.plans import plan_router
 from prime_rl.control.server import ControlServer
 from prime_rl.orchestrator.algo.routing import is_trainable
 from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
@@ -45,6 +46,7 @@ from prime_rl.orchestrator.batch import BatchPacker
 from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
 from prime_rl.orchestrator.concurrency import ConcurrencyController
+from prime_rl.orchestrator.curriculum.plans import Plans
 from prime_rl.orchestrator.dispatcher import Dispatcher, DispatcherMode
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.eval_sink import EvalSink
@@ -77,7 +79,7 @@ from prime_rl.transports.weights import WeightReceiver, setup_weight_receiver
 from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, safe_cancel
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
-from prime_rl.utils.pathing import get_broadcast_dir, get_config_dir, resolve_latest_ckpt_step
+from prime_rl.utils.pathing import get_broadcast_dir, get_config_dir, get_curriculum_dir, resolve_latest_ckpt_step
 from prime_rl.utils.utils import clean_exit
 
 # Wall-clock budget for post-training cleanup; force-exit if graceful
@@ -279,6 +281,12 @@ class Orchestrator:
             resume_path = resume.dir / "orchestrator" if resume is not None and resume.dir is not None else None
             self.ckpt_manager.load(self.progress, self.train_source, step=self.resume_step, path=resume_path)
             self.progress.step = self.resume_step + 1
+        self.train_source.plans = Plans(
+            self.train_source,
+            get_curriculum_dir(config.output_dir),
+            resume_step=self.resume_step,
+            replay_from=config.curriculum_plans.replay_from,
+        )
 
         get_logger().info("Waiting for policy inference pool to be ready")
         t0 = time.perf_counter()
@@ -411,7 +419,8 @@ class Orchestrator:
                 requires_step=True,
                 on_submit=lambda: loop.call_soon_threadsafe(self.control_requested.set),
             )
-            ControlServer(self.controller, config.control).start()
+            routers = [plan_router(self.train_source.plans, self.control_status)]
+            ControlServer(self.controller, config.control, routers).start()
             self.component_tasks.append(asyncio.create_task(self.serve_control(), name="control"))
 
         # Anchor step-time clock so the first step measures startup → first batch
@@ -958,6 +967,15 @@ class Orchestrator:
             self.controller.mark_saved(step)
             get_logger().info(f"Paused at step {step}, saved its state")
 
+    def control_status(self) -> dict[str, Any]:
+        """The run's state for the control API's ``/v1/status``, read from its thread."""
+        inflight = list(self.dispatcher.inflight.values())
+        return {
+            "collecting_step": self.progress.step,
+            "trainer_step": self.policy.version,
+            "rollouts_in_flight": sum(meta.kind == "train" for meta in inflight),
+        }
+
     async def serve_control(self) -> None:
         """Apply each submitted pause on the event loop, also while a send blocks on the trainer."""
         while True:
@@ -1005,6 +1023,7 @@ class Orchestrator:
             if self.dispatcher is not None:
                 get_logger().debug("Stopping dispatcher")
                 await self.dispatcher.stop()
+            self.train_source.plans.close()
             if self.watcher is not None:
                 get_logger().debug("Stopping weight watcher")
                 await self.watcher.stop()

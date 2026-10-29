@@ -354,6 +354,28 @@ curl -X POST localhost:8041/v1/actions -H 'content-type: application/json' -d '{
 
 Once paused, both keep serving the API until the run is stopped, so its owner can read the committed step first.
 
+### Planning a Live Run's Curriculum
+
+With `--orchestrator.control`, the orchestrator's API also takes curriculum plans: which Tasks the next steps dispatch. A plan is keyed by a step, or `"default"` for every step without its own, and combines any of:
+
+- `tasks`: `[{"env": ..., "key": ...}]`, dispatched in order, one per group, from the step's first group (repeats allowed). After them the step samples.
+- `sources`: env weights in place of the configured ratios; an env it leaves out gets `"others"`, else 0.
+- `weights`: multipliers on a Task's weight within its env, keyed `task:<key>`, `label:<label>` or `pool:<pool>`. A Task's weight is its difficulty pool's weight (1 under the standard sampler) times every multiplier it matches; 0 excludes it, and an env whose every Task is excluded sits the step out. A label is a name in the Task data's `labels`, or `<field>=<value>` for one of its fields (`label:rung=R2`); `pool:unseen` matches Tasks no group has scored yet.
+
+A step's plan is fixed when its first Task is dispatched, which is while the orchestrator collects that step, so its groups train in that step's batch or, off-policy, the next ones. A plan for a step whose dispatch has started is refused with 409, whose body names `current_dispatch_step` and `next_open_step`; `"step": "next"` takes the first open step atomically. A step without a plan samples exactly as configured.
+
+```bash
+curl -X POST localhost:8041/v1/plans -H 'content-type: application/json' \
+  -d '{"step": "next", "author": "me", "note": "drill the write tasks", "plan": {"sources": {"fineract": 2, "others": 1}, "weights": {"label:kind=write": 3, "pool:easy": 0}}}'
+curl localhost:8041/v1/plans            # every plan; GET or DELETE /v1/plans/{step|default} for one
+curl localhost:8041/v1/status           # dispatch step, trainer step, rollouts in flight, steps that used plans
+curl 'localhost:8041/v1/stats?step=12&env=fineract&limit=20'   # per env and per Task; no step for the run's totals
+```
+
+The orchestrator records its curriculum under `<output_dir>/curriculum/`, with or without the API: `plans.jsonl` holds every plan posted or deleted with its time, author and note; `dispatch.jsonl` holds every dispatched Task with its step and what chose it (its plan's id, or `null` for the configured sampler), plus a summary line per step; `groups.jsonl` holds every finalized group's outcome, which the stats are built from. A resume reads them back up to its step.
+
+To rerun a recorded run's Task schedule, set `--orchestrator.curriculum-plans.replay-from` to another run's `curriculum/dispatch.jsonl`: each step dispatches the Tasks the record lists for it, in order, then samples, and steps the record lacks sample as configured. A replaying run refuses plans. Replay repeats the schedule, not the outcomes: sampling, the envs and their worlds stay stochastic, and a step that dispatches more groups than its recorded step samples the rest.
+
 ### Exporting Checkpoints
 
 Trainer checkpoints are DCP-sharded; export them to HF-format safetensors with `tools/convert_dcp_to_bf16.py`. The script reads the model config from the run's resolved config and writes sharded safetensors plus config/tokenizer assets to `<ckpt_dir>/weights` (or a second positional arg). It exports full fine-tunes only — LoRA checkpoints are rejected.

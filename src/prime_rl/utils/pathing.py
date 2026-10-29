@@ -258,6 +258,11 @@ def get_ckpt_dir(output_dir: Path) -> Path:
     return output_dir / "checkpoints"
 
 
+def get_curriculum_dir(output_dir: Path) -> Path:
+    """The orchestrator's curriculum plans and its record of each step's Tasks and each group's outcome."""
+    return output_dir / "curriculum"
+
+
 def get_batch_dir(output_dir: Path) -> Path:
     return output_dir / "batches"
 

@@ -466,6 +466,17 @@ class OrchestratorControlConfig(ControlConfig):
     """Port the control API listens on, next to the trainer's 8040 on a single node."""
 
 
+class CurriculumPlansConfig(BaseConfig):
+    """Per-step curriculum plans. The orchestrator records every Task it dispatches under
+    ``<output_dir>/curriculum``, and with ``[orchestrator.control]`` takes plans over its API."""
+
+    replay_from: Path | None = None
+    """A recorded run's ``curriculum/dispatch.jsonl`` to replay: each step dispatches the Tasks the record
+    lists for it, in order, then samples as configured, and a step the record lacks samples as configured.
+    A replaying run refuses plans. It repeats the Task schedule, not the outcomes: sampling and the envs
+    stay stochastic."""
+
+
 class OrchestratorConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
     """The model being trained: its model fields plus the client of the live
@@ -546,8 +557,11 @@ class OrchestratorConfig(BaseConfig):
     """BetterStack heartbeat configuration for monitoring training progress."""
 
     control: OrchestratorControlConfig | None = None
-    """Serve the orchestrator's control API (pause at a step the trainer accepted). If None, it
+    """Serve the orchestrator's control API: pause at a step the trainer accepted, and post per-step
+    curriculum plans (``curriculum_plans``). A step without a plan samples as configured. If None, it
     takes no control requests."""
+
+    curriculum_plans: CurriculumPlansConfig = CurriculumPlansConfig()
 
     @model_validator(mode="after")
     def auto_setup_tokenizer(self):
