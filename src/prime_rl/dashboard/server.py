@@ -24,6 +24,7 @@ from pathlib import Path
 
 import orjson
 
+from prime_rl.dashboard import dj
 from prime_rl.entrypoints.dashboard import DAEMON_FILE, DIRS_FILE, STATE_DIR, registry_lock
 from prime_rl.monitors.file.traces import get_annotations_dir, get_index_path, get_trace_stream
 from prime_rl.monitors.file.traces.chunks import open_chunk
@@ -580,6 +581,16 @@ def read_metrics(run: str, offset: int = 0) -> dict:
         except orjson.JSONDecodeError:
             continue
     return {"rows": rows, "offset": offset + consumed, "size": size}
+
+
+@app.get("/api/runs/{run}/dj")
+def read_dj(run: str, control: str | None = None) -> dict:
+    """The DJ tab's view of an RL run (``dj.view``); ``control`` is the orchestrator's control API, for live state."""
+    run_dir = get_run_dir(run)
+    run_type, config = main_config(run_dir)
+    if run_type != "rl":
+        return {"available": False, "reason": "The DJ tab reads RL runs."}
+    return dj.view(run_dir, config, control_url=control)
 
 
 # ------------------------------------------------------------------------ rollouts
@@ -1957,7 +1968,7 @@ def get_episode(
 # filesystem reader: commands carry addresses and short highlight anchors, never
 # report or episode payloads.
 
-VIEW_TABS = {"metrics", "config", "traces", "logs", "report"}
+VIEW_TABS = {"metrics", "config", "traces", "logs", "report", "dj"}
 VIEW_KEYS = {"run", "tab", "step", "kind", "subset", "episode", "line", "trace", "branch", "report", "highlight"}
 HIGHLIGHT_KEYS = {"node", "quote", "prefix", "suffix", "reason", "field"}
 

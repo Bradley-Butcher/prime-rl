@@ -232,6 +232,7 @@ async function selectRun(name, deferTab = false) {
     ...state.report,
     loaded: false, files: [], file: null, text: null, mtime: null, citations: {}, order: [], verify: new Map(),
   };
+  resetDj(); // dj.js
   applyRunTypeControls();
   syncFilterControls();
   renderOverview();
@@ -404,6 +405,7 @@ async function activateTab(tab, force = false) {
     if (!state.report.loaded) await initReport();
     else if (state.live) await refreshReport();
   }
+  if (tab === "dj") await initDj(); // dj.js
 }
 
 /* ---------------------------------------------------------------- metrics */
@@ -7450,6 +7452,7 @@ async function pollDashboard() {
     else if (state.tab === "logs" && state.logs.loaded) await pollLogs();
     else if (state.tab === "traces" && state.traces.loaded) await refreshTraces();
     else if (state.tab === "report" && state.report.loaded) await refreshReport();
+    else if (state.tab === "dj") await refreshDj();
     await runsRefresh;
   } catch (err) {
     console.warn("poll failed", err);
