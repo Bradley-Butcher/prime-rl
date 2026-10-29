@@ -1,8 +1,9 @@
 import contextlib
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import uvicorn
+from fastapi import APIRouter
 
 from prime_rl.configs.shared import ControlConfig
 from prime_rl.control.app import create_app
@@ -12,11 +13,11 @@ from prime_rl.control.controller import Controller
 class ControlServer:
     """Serves the control API from a background thread. A no-op without a ``[control]`` config."""
 
-    def __init__(self, controller: Controller, config: ControlConfig | None) -> None:
+    def __init__(self, controller: Controller, config: ControlConfig | None, routers: Sequence[APIRouter] = ()) -> None:
         self.server = None
         if config is not None:
             uvicorn_config = uvicorn.Config(
-                create_app(controller),
+                create_app(controller, routers),
                 host=config.host,
                 port=config.port,
                 log_level="warning",

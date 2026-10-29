@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from collections import defaultdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import verifiers.v1 as vf
 
@@ -12,6 +12,9 @@ from prime_rl.orchestrator.curriculum import Curriculum
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.types import TaskRequest
 from prime_rl.orchestrator.utils import episode_env_name
+
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.curriculum.plans import Plans
 
 
 class TrainSource:
@@ -24,20 +27,30 @@ class TrainSource:
             raise ValueError("TrainSource needs at least one train env")
 
         self.curricula: dict[str, Curriculum] = {}
+        self.tasks: dict[str, list[vf.Task] | None] = {}
+        """Each env's Tasks, or None for an env that streams them."""
         for env in self.envs:
             if env.tasks is None:
                 raise RuntimeError(f"env {env.name} not started")
             tasks = env.tasks if env.num_tasks is None else list(env.tasks)
             self.curricula[env.name] = Curriculum(env.config.curriculum, tasks)
+            self.tasks[env.name] = None if env.num_tasks is None else tasks
 
         self.env_names = [env.name for env in self.envs]
         self.weights = [float(env.config.ratio) for env in self.envs]
         self._admitted: dict[str, int] = defaultdict(int)
         self._rejected: dict[str, int] = defaultdict(int)
+        self.plans: Plans | None = None
+        """Per-step curriculum plans set over the control API; None samples as configured."""
 
     def next_task(self, *, step: int) -> TaskRequest:
+        env_name, task = self.plans.draw(step) if self.plans is not None else self.draw()
+        return TaskRequest(env_name=env_name, task=task, step=step)
+
+    def draw(self) -> tuple[str, vf.Task]:
+        """An env by ratio, then its curriculum's next Task."""
         env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
-        return TaskRequest(env_name=env_name, task=next(self.curricula[env_name].sampler), step=step)
+        return env_name, next(self.curricula[env_name].sampler)
 
     def on_result(self, group: list[vf.Episode]) -> bool:
         """Report a finalized group and return whether it should train."""
@@ -47,6 +60,8 @@ class TrainSource:
         admitted = self.curricula[env_name].on_result(group)
         if not isinstance(admitted, bool):
             raise TypeError(f"Curriculum.on_result() must return bool, got {type(admitted).__name__}")
+        if self.plans is not None:
+            self.plans.observe(group)
         if admitted:
             self._admitted[env_name] += 1
         else:

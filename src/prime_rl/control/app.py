@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, status
+from collections.abc import Sequence
+
+from fastapi import APIRouter, FastAPI, HTTPException, status
 
 from prime_rl.control.controller import Controller
 from prime_rl.control.types import (
@@ -10,7 +12,8 @@ from prime_rl.control.types import (
 )
 
 
-def create_app(controller: Controller) -> FastAPI:
+def create_app(controller: Controller, routers: Sequence[APIRouter] = ()) -> FastAPI:
+    """``routers`` serve a component's own routes next to the actions."""
     app = FastAPI(title="prime-rl control")
 
     @app.get("/v1/actions/{action_id}")
@@ -29,4 +32,6 @@ def create_app(controller: Controller) -> FastAPI:
         except InvalidActionError as error:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
 
+    for router in routers:
+        app.include_router(router)
     return app
