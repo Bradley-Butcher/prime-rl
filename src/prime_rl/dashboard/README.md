@@ -14,6 +14,16 @@ kill/restart commands, and the local view-command/report contract.
 Opening a trace adds `trace=<id>` to the URL. Bookmarking or reopening that URL
 restores the selected trace, whether it is still live or has finished.
 
+The **DJ** tab steers an RL run's Task mix step by step. It shows:
+
+- each source's share, signal and pass@1;
+- the label and Task weights;
+- health against the rl-dj watchlist, and the reward shaping;
+- recent plan changes and the step queued next.
+
+It reads the run's `curriculum/*.jsonl`, `metrics.jsonl` and trace stream (`dj.py`, `rollout_stats.py`, which ports
+the rl-dj skill's `gather.py`); an optional control API URL adds live dispatch state.
+
 The Config and Logs views keep each launch attempt available. The Config view
 shows a copyable command above the launch TOML or resolved JSON. Both views
 open at `latest (attempt <n>)` and let you select an earlier attempt.
