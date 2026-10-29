@@ -14,6 +14,7 @@ from verifiers.v1.types import AssistantMessage, Tool, ToolMessage, Usage, UserM
 from prime_rl.configs.algorithm import GRPOAlgoConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.algo.base import Algorithm
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.train_sink import TrainSink
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.orchestrator.types import DispatchFailure, GroupCancellation, Progress
@@ -22,7 +23,7 @@ from prime_rl.utils.logger import setup_logger
 setup_logger("warning")
 
 
-def trace(*, advantage=1.0, ok=True, trainable=True, sampled=True):
+def trace(*, advantage=1.0, ok=True, trainable=True, sampled=True, reward=1.0, stop=None, unfinished_reply=False):
     tools = [Tool(name="search", description="schema" * 100, parameters={"type": "object"})]
     nodes = [
         MessageNode(message=UserMessage(content="prompt"), tools=tools, token_ids=[1], mask=[False]),
@@ -45,6 +46,20 @@ def trace(*, advantage=1.0, ok=True, trainable=True, sampled=True):
             routed_experts=np.ones((2, 2, 2), dtype=np.uint8),
         ),
     ]
+    calls = [ModelCall(node=2, usage=Usage(prompt_tokens=2, completion_tokens=2), finish_reason="stop")]
+    if unfinished_reply:
+        # A reply committed with no finish reason, as an aborted generation is.
+        nodes.append(
+            MessageNode(
+                parent=2,
+                message=AssistantMessage(content="ans"),
+                sampled=True,
+                token_ids=[5, 6],
+                mask=[True, True],
+                logprobs=[-0.5, -0.6],
+            )
+        )
+        calls.append(ModelCall(node=3, finish_reason=None))
     return vf.Trace(
         task=vf.TraceTask(type="Task", data=vf.TaskData(idx=0, prompt=None)),
         agent=vf.AgentInfo(config=vf.AgentConfig(), trainable=trainable),
@@ -52,29 +67,31 @@ def trace(*, advantage=1.0, ok=True, trainable=True, sampled=True):
         nodes=nodes,
         ok=ok,
         is_completed=True,
-        rewards={"correct": vf.Reward(score=1.0)},
-        calls=[ModelCall(node=2, usage=Usage(prompt_tokens=2, completion_tokens=2), finish_reason="stop")],
+        stop_condition=stop,
+        is_timeout=stop is not None and stop.endswith("_timeout"),
+        rewards={"correct": vf.Reward(score=reward)},
+        calls=calls,
         errors=[] if ok else [vf.Error(type="ProviderError", message="failed")],
     )
 
 
-def episode(traces, *, group="g", version=0):
+def episode(traces, *, group="g", version=0, ok=True):
     return vf.Episode(
         env=vf.EnvInfo(id="test", name="test"),
         task=traces[0].task,
         group=vf.GroupInfo(id=group),
         traces=traces,
-        ok=True,
+        ok=ok,
         run=vf.TrainRunInfo(id="run", work=vf.TrainWorkInfo(step=1, policy=vf.PolicySpan(start=version, end=version))),
     )
 
 
-def sink(*, constant=True, admitted=True, batch_size=100):
+def sink(*, constant=True, admitted=True, batch_size=100, group_size=1, algorithm=None):
     config = OrchestratorConfig(batch_size=batch_size, constant_trainer_batch_size=constant, max_off_policy_steps=1)
     env = SimpleNamespace(
-        config=SimpleNamespace(group_size=1, sampling=SimpleNamespace(temperature=1.0)),
+        config=SimpleNamespace(group_size=group_size, sampling=SimpleNamespace(temperature=1.0)),
         requires_sampling_masks=False,
-        algorithm=Algorithm(GRPOAlgoConfig(), None),
+        algorithm=algorithm or Algorithm(GRPOAlgoConfig(), None),
     )
     return TrainSink(
         config,
@@ -227,5 +244,80 @@ def test_partial_window_and_shutdown_release():
         assert window.attempts == 1
         assert window.metrics.to_dict()["rollout/queued/cancelled"] == 1
         assert s.take_rollout_window(force=True) is None
+
+    asyncio.run(run())
+
+
+async def arrive(s, algorithm, t, *, ok=True):
+    """A completed train episode as the dispatcher hands it to the sink: its timeouts settled first."""
+    ep = episode([t], ok=ok)
+    algorithm.settle_timeouts(ep)
+    return await s.add(ep)
+
+
+def trained_advantages(sample):
+    return [advantage for advantage, trains in zip(sample.advantages, sample.mask) if trains]
+
+
+@pytest.mark.parametrize("finalize_failed", [False, True])
+@pytest.mark.parametrize("timeouts_as_failures", [True, False])
+def test_an_agent_timeout_trains_in_its_group_as_a_failure_only_when_asked(timeouts_as_failures, finalize_failed):
+    async def run():
+        algorithm = GRPOAlgorithm(GRPOAlgoConfig(timeouts_as_failures=timeouts_as_failures), None)
+        s = sink(group_size=8, batch_size=8 if timeouts_as_failures else 7, algorithm=algorithm)
+        # The env passed the timed-out rollout, or its finalize raised after the deadline and it was never scored.
+        timed_out = trace(reward=1.0, stop="agent_timeout", ok=not finalize_failed)
+        if finalize_failed:
+            timed_out.rewards = {}
+            timed_out.errors = [vf.Error(type="TaskError", message="task finalize: POST /finish: HTTP 500")]
+        passed = [trace(reward=1.0) for _ in range(3)]
+        failed = [trace(reward=0.0) for _ in range(4)]
+        for t in [timed_out, *passed, *failed]:
+            batch = await arrive(s, algorithm, t, ok=t.ok)
+
+        trained = {sample.trace_id: sample for sample in batch.samples}
+        if timeouts_as_failures:
+            assert len(trained) == 8
+            assert timed_out.reward == 0.0
+            assert trained_advantages(trained[timed_out.id]) == pytest.approx([-3 / 8] * 2)
+            assert all(trained_advantages(trained[t.id]) == pytest.approx([5 / 8] * 2) for t in passed)
+        else:
+            assert len(trained) == 7 and timed_out.id not in trained and timed_out.has_error
+            assert all(trained_advantages(trained[t.id]) == pytest.approx([4 / 7] * 2) for t in passed)
+        metrics = batch.cohort.effective.metrics.to_wandb(prefix="train/agg", subset="effective")
+        assert metrics["train/agg/effective/agent/timeouts_as_failures"] == float(timeouts_as_failures)
+
+    asyncio.run(run())
+
+
+def test_a_timed_out_rollouts_unfinished_last_reply_is_not_trained():
+    async def run():
+        algorithm = GRPOAlgorithm(GRPOAlgoConfig(timeouts_as_failures=True), None)
+        s = sink(group_size=2, batch_size=2, algorithm=algorithm)
+        timed_out = trace(reward=0.0, stop="agent_timeout", unfinished_reply=True)
+        await arrive(s, algorithm, timed_out)
+        batch = await arrive(s, algorithm, trace(reward=1.0))
+
+        [sample] = [sample for sample in batch.samples if sample.trace_id == timed_out.id]
+        assert sample.token_ids == [1, 2, 3, 4, 5, 6]
+        assert sample.mask == [False, False, True, True, False, False]
+        assert trained_advantages(sample) == pytest.approx([-0.5, -0.5])
+
+    asyncio.run(run())
+
+
+def test_with_timeouts_as_failures_errors_and_timeouts_without_a_reply_are_still_left_out():
+    async def run():
+        algorithm = GRPOAlgorithm(GRPOAlgoConfig(timeouts_as_failures=True), None)
+        s = sink(group_size=5, algorithm=algorithm)
+        passed, failed = trace(reward=1.0), trace(reward=0.0)
+        task_error = trace(ok=False, stop="task_error")
+        never_replied = trace(stop="agent_timeout", sampled=False)
+        setup_timeout = trace(stop="setup_timeout", sampled=False)
+        for t in (passed, failed, task_error, never_replied, setup_timeout):
+            await arrive(s, algorithm, t, ok=t.ok)
+
+        assert set(s.pending_batch) == {passed.id, failed.id}
+        assert all(t.has_error for t in (task_error, never_replied, setup_timeout))
 
     asyncio.run(run())

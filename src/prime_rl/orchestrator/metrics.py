@@ -424,6 +424,12 @@ class TrainMetrics(EpisodeMetrics):
                 {"mean": sum(float(record.admitted) for record in traces.records)},
                 len(traces.records),
             )
+            if subset == "effective":
+                # A timed-out trace trains only as a failure scored 0 (``timeouts_as_failures``).
+                out.count(
+                    f"{metric_prefix}/timeouts_as_failures",
+                    float(sum(record.trace.is_timeout for record in traces.records)),
+                )
         return out
 
 
