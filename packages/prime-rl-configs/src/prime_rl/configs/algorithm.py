@@ -104,6 +104,45 @@ class LinearLengthPenaltyConfig(BaseConfig):
 LengthPenaltyConfig: TypeAlias = LinearLengthPenaltyConfig
 
 
+class StuckPenaltyConfig(BaseConfig):
+    """A cut in a rollout's positive reward for its stuck calls, which the env counts in one of its metrics: the reward is multiplied by ``1 - min(cap, per_call * max(0, count - free))``. A failure (reward 0) stays 0, so a group that only failed stays uniform and the zero-advantage gate still drops it; any pass still beats any failure. Off while ``per_call`` is 0."""
+
+    metric: str = "stuck_calls"
+    """The env's metric that counts a rollout's stuck calls. A rollout without it is not cut, and a warning is logged."""
+
+    per_call: float = Field(0.0, ge=0, allow_inf_nan=False)
+    """The share of the reward each stuck call past ``free`` takes. 0 turns the penalty off."""
+
+    free: int = Field(2, ge=0)
+    """Stuck calls a rollout makes without penalty."""
+
+    cap: float = Field(0.3, ge=0, le=1, allow_inf_nan=False)
+    """The most of the reward the penalty takes."""
+
+    def factor(self, count: float) -> float:
+        """What a positive reward is multiplied by for ``count`` stuck calls."""
+        return 1.0 - min(self.cap, self.per_call * max(0.0, count - self.free))
+
+
+class UnfinishedRewardConfig(BaseConfig):
+    """The reward of a rollout that didn't finish: one a turn or token limit cut off (``Trace.is_truncated``), or one
+    its agent's deadline stopped that trains as a failure (``timeouts_as_failures``)."""
+
+    reward: float | None = Field(None, allow_inf_nan=False)
+    """The reward such a rollout trains with in place of its own, whether or not the env passed it. None keeps the
+    env's score for a cut-off rollout and 0 for a timed-out one."""
+
+
+class RewardShapingConfig(BaseConfig):
+    """Reward shaping GRPO applies before its baseline, which ``POST /v1/shaping`` on the orchestrator's control API
+    changes during a run from a coming dispatch step (see the training docs). Only the advantages see it: the trace's
+    rewards, the difficulty-pool sampler, the curriculum stats and eval keep the env's scores. An unfinished rollout
+    takes ``unfinished.reward`` when it is set; any other rollout's positive reward is cut for its stuck calls."""
+
+    stuck: StuckPenaltyConfig = StuckPenaltyConfig()
+    unfinished: UnfinishedRewardConfig = UnfinishedRewardConfig()
+
+
 class EchoRoleConfig(BaseConfig):
     """Echo CE supervision for one message role."""
 
@@ -223,6 +262,9 @@ class GRPOAlgoConfig(BaseAlgoConfig):
 
     length_penalty: LengthPenaltyConfig | None = None
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
+
+    shaping: RewardShapingConfig = RewardShapingConfig()
+    """Reward shaping before the baseline, changeable during a run: a stuck-call penalty on passes and a fixed reward for unfinished rollouts, both off by default (see ``RewardShapingConfig``). A length penalty applies on top."""
 
     length_weighted_baseline: bool = False
     """Use the token-length-weighted group mean reward ``sum_i(L_i * r_i) / sum_i(L_i)`` as the baseline instead of the plain mean, where ``L_i`` is the number of trainable (mask-True, policy-sampled) tokens of rollout ``i`` summed across all its turns."""

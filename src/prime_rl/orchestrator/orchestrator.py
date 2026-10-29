@@ -40,6 +40,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.control.controller import Controller
 from prime_rl.control.plans import plan_router
 from prime_rl.control.server import ControlServer
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.routing import is_trainable
 from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
 from prime_rl.orchestrator.batch import BatchPacker
@@ -47,6 +48,7 @@ from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
 from prime_rl.orchestrator.concurrency import ConcurrencyController
 from prime_rl.orchestrator.curriculum.plans import Plans
+from prime_rl.orchestrator.curriculum.shaping import Shaping
 from prime_rl.orchestrator.dispatcher import Dispatcher, DispatcherMode
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.eval_sink import EvalSink
@@ -287,6 +289,13 @@ class Orchestrator:
             resume_step=self.resume_step,
             replay_from=config.curriculum_plans.replay_from,
         )
+        self.shaping = Shaping(
+            self.train_source.plans,
+            {env.name: env.algorithm for env in self.train_envs if isinstance(env.algorithm, GRPOAlgorithm)},
+            get_curriculum_dir(config.output_dir),
+            resume_step=self.resume_step,
+            replay_from=config.curriculum_plans.replay_from,
+        )
 
         get_logger().info("Waiting for policy inference pool to be ready")
         t0 = time.perf_counter()
@@ -419,7 +428,7 @@ class Orchestrator:
                 requires_step=True,
                 on_submit=lambda: loop.call_soon_threadsafe(self.control_requested.set),
             )
-            routers = [plan_router(self.train_source.plans, self.control_status)]
+            routers = [plan_router(self.train_source.plans, self.control_status, self.shaping)]
             ControlServer(self.controller, config.control, routers).start()
             self.component_tasks.append(asyncio.create_task(self.serve_control(), name="control"))
 

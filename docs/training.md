@@ -381,6 +381,20 @@ The orchestrator records its curriculum under `<output_dir>/curriculum/`, with o
 
 To rerun a recorded run's Task schedule, set `--orchestrator.curriculum-plans.replay-from` to another run's `curriculum/dispatch.jsonl`: each step dispatches the Tasks the record lists for it, in order, then samples, and steps the record lacks sample as configured. A replaying run refuses plans. Replay repeats the schedule, not the outcomes: sampling, the envs and their worlds stay stochastic, and a step that dispatches more groups than its recorded step samples the rest.
 
+### Shaping a Live Run's Reward
+
+With `--orchestrator.control`, the orchestrator's API also changes GRPO's reward shaping (`algo.shaping`, see [Algorithms](algorithms.md)) from a coming dispatch step: `stuck`, the cut in a pass's reward for its stuck calls, and `unfinished`, the reward of a cut-off or timed-out rollout. A change names the fields it sets, which every GRPO env takes on top of its config; a field it leaves out keeps its setting. A change is sticky: it applies to every group dispatched at its step or later, until a later change. A group is shaped by the step it was dispatched at, not when it is scored, so groups in flight keep the setting they were dispatched under. A change for a step whose dispatch has started is refused with 409, as a plan is; `"step": "next"` takes the first open step.
+
+```bash
+curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
+  -d '{"step": "next", "author": "me", "note": "near-duplicate calls climbing", "stuck": {"per_call": 0.05}}'
+curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
+  -d '{"step": "next", "author": "me", "note": "runaways", "unfinished": {"reward": -1}}'
+curl localhost:8041/v1/shaping          # the setting dispatching now, pending and past changes; /v1/status has the first two
+```
+
+`{"unfinished": {"reward": null}}` gives cut-off and timed-out rollouts the env's scores again, and `{"stuck": {"per_call": 0}}` turns the stuck penalty off. Each change is recorded in `curriculum/shaping.jsonl`, and each group's setting, with how many of its rollouts each lever changed, in its `groups.jsonl` line. A resume reads the changes back; a run with `curriculum-plans.replay-from` replays the changes recorded beside that `dispatch.jsonl` and refuses new ones.
+
 ### Exporting Checkpoints
 
 Trainer checkpoints are DCP-sharded; export them to HF-format safetensors with `tools/convert_dcp_to_bf16.py`. The script reads the model config from the run's resolved config and writes sharded safetensors plus config/tokenizer assets to `<ckpt_dir>/weights` (or a second positional arg). It exports full fine-tunes only — LoRA checkpoints are rejected.

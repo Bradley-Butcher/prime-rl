@@ -25,6 +25,11 @@ def iter_trainable_traces(episodes: list[vf.Episode], drop_truncated: bool = Fal
                 yield episode, trace
 
 
+def is_unfinished(trace: vf.Trace) -> bool:
+    """Whether a turn or token limit cut the trace off, or its agent's own deadline stopped it."""
+    return trace.is_truncated or (trace.is_timeout and trace.stop_condition == AGENT_TIMEOUT)
+
+
 def leave_out_unfinished_reply(trace: vf.Trace) -> None:
     """Keep the trace's last committed reply out of training when the engine never finished it (its call has no
     finish reason): its tokens stay in the sequence as context, none of them sampled. verifiers commits no reply that

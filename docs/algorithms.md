@@ -331,6 +331,14 @@ type = "grpo"
 type = "linear"
 ```
 
+**Reward shaping** (`shaping` on the `grpo`-family algorithms), both levers off by default, changes the rewards the baseline and advantages take, before any length penalty; the trace's rewards, the difficulty-pool sampler, the curriculum stats and eval keep the env's scores. `shaping.unfinished.reward` is the reward of a rollout a turn or token limit cut off, or one its agent's deadline stopped under `timeouts_as_failures`, in place of its own (unset, a cut-off rollout keeps the env's score and a timed-out one 0). `shaping.stuck` cuts every other positive reward for its stuck calls, which the env counts in a metric (`metric`, default `stuck_calls`): the reward is multiplied by $1 - \min(\text{cap}, \text{per\_call} \cdot \max(0, n - \text{free}))$, so a failure stays 0 and a group that only failed stays uniform, while a group of passes that differ in stuck calls becomes mixed. A `unfinished.reward` below 0 makes a group of failures mixed when one of them ran out. Both can be changed while the run trains, from a coming dispatch step (see [Shaping a Live Run's Reward](training.md#shaping-a-live-runs-reward)).
+
+```toml
+[orchestrator.train.algo.shaping]
+stuck = { per_call = 0.05, free = 2, cap = 0.3 }
+unfinished = { reward = -1.0 }
+```
+
 A **length-weighted baseline** (`length_weighted_baseline = true` on the `grpo`-family algorithms) replaces the plain group mean with $b = \sum_i L_i s_i / \sum_i L_i$, where $L_i$ is the number of trainable (policy-sampled, loss-masked) tokens of rollout $i$, summed across all its turns; it applies after the length penalty. With token-level loss normalization, long rollouts carry more gradient weight, so this baseline makes the per-token advantage zero-mean across the group's tokens rather than across rollouts.
 
 **Prompt-mean loss aggregation** (`loss_aggregation = "prompt"` on `grpo` and `echo`; default `"token"`). By default every `rl` token in the batch weighs the same, so prompts whose groups produce long trajectories dominate the gradient. With `"prompt"`, the loss is MiMo-V2.6's prompt-mean (Eq. 1): the mean over prompt groups $q$ of $\frac{1}{T_q}\sum_{t \in q} \mathcal{L}_{rl,t}$, where $T_q$ is the group's total trainable tokens. MiMo uses it to keep response length from growing too fast. `score_group` gives each trainable token of the group the `rl` weight $1/T_q$, so each group's weights sum to 1 and $N_{rl}$ (the summed weights) is the number of groups in the step. Zero-advantage tokens are still dropped from the `rl` component, so a group with a zero-advantage rollout keeps less than its full weight of 1. All envs with an `rl` loss in a run must use the same `loss_aggregation`.
