@@ -1,6 +1,7 @@
+from collections.abc import Sequence
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import APIRouter, FastAPI, HTTPException, status
 
 from prime_rl.control.controller import Controller
 from prime_rl.control.types import (
@@ -18,8 +19,13 @@ from prime_rl.control.types import (
 from prime_rl.utils.pathing import get_all_ckpt_steps, get_step_path
 
 
-def create_app(controller: Controller, ckpt_dir: Path | None = None) -> FastAPI:
-    """``ckpt_dir`` is the trainer's checkpoint dir; without one, ``GET /v1/checkpoints`` answers 404."""
+def create_app(
+    controller: Controller,
+    ckpt_dir: Path | None = None,
+    routers: Sequence[APIRouter] = (),
+) -> FastAPI:
+    """``ckpt_dir`` is the trainer's checkpoint dir; without one, ``GET /v1/checkpoints`` answers 404.
+    ``routers`` serve a component's own routes next to the actions."""
     app = FastAPI(title="prime-rl control")
 
     @app.get("/v1/actions/{action_id}")
@@ -61,4 +67,6 @@ def create_app(controller: Controller, ckpt_dir: Path | None = None) -> FastAPI:
             ]
         )
 
+    for router in routers:
+        app.include_router(router)
     return app

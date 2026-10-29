@@ -26,7 +26,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import verifiers.v1 as vf
 from pydantic import ValidationError
@@ -42,6 +42,7 @@ from prime_rl import monitors
 from prime_rl.configs.diff import ConfigChange, diff_config, merge_resumed_config
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.control.controller import Controller, validate_update
+from prime_rl.control.plans import plan_router
 from prime_rl.control.server import ControlServer
 from prime_rl.control.types import ConfigUpdate, InvalidConfigError, Reconfigurable
 from prime_rl.orchestrator.algo.routing import is_trainable
@@ -50,6 +51,7 @@ from prime_rl.orchestrator.batch import BatchPacker
 from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
 from prime_rl.orchestrator.concurrency import ConcurrencyController
+from prime_rl.orchestrator.curriculum.plans import Plans
 from prime_rl.orchestrator.dispatcher import Dispatcher, DispatcherMode
 from prime_rl.orchestrator.draft import DraftLoader
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
@@ -90,6 +92,7 @@ from prime_rl.utils.logger import format_time, get_logger, setup_logger
 from prime_rl.utils.pathing import (
     get_broadcast_dir,
     get_config_dir,
+    get_curriculum_dir,
     resolve_latest_ckpt_step,
     write_resolved_config,
 )
@@ -320,6 +323,12 @@ class Orchestrator:
                 self.progress, self.train_source, step=self.resume_step, path=resume_path(self.config)
             )
             self.progress.step = self.resume_step + 1
+        self.train_source.plans = Plans(
+            self.train_source,
+            get_curriculum_dir(config.output_dir),
+            resume_step=self.resume_step,
+            replay_from=config.curriculum_plans.replay_from,
+        )
 
         get_logger().info("Waiting for policy inference pool to be ready")
         t0 = time.perf_counter()
@@ -471,7 +480,8 @@ class Orchestrator:
                 read_config=lambda: (self.config_revision, self.config),
                 check_config=self.check_config,
             )
-            ControlServer(self.controller, config.control).start()
+            routers = [plan_router(self.train_source.plans, self.control_status)]
+            ControlServer(self.controller, config.control, routers=routers).start()
             self.component_tasks.append(asyncio.create_task(self.serve_control(), name="control"))
         # A failed component (e.g. the watcher after a weight update fails) cancels the step loop
         # wherever it waits, instead of relying on the loop to poll for it.
@@ -1180,6 +1190,15 @@ class Orchestrator:
             "revision": self.config_revision,
         }
 
+    def control_status(self) -> dict[str, Any]:
+        """The run's state for the control API's ``/v1/status``, read from its thread."""
+        inflight = list(self.dispatcher.inflight.values())
+        return {
+            "collecting_step": self.progress.step,
+            "trainer_step": self.policy.version,
+            "rollouts_in_flight": sum(meta.kind == "train" for meta in inflight),
+        }
+
     async def serve_control(self) -> None:
         """Apply each submitted pause or checkpoint on the event loop, also while a send blocks on
         the trainer."""
@@ -1228,6 +1247,7 @@ class Orchestrator:
             if self.dispatcher is not None:
                 get_logger().debug("Stopping dispatcher")
                 await self.dispatcher.stop()
+            self.train_source.plans.close()
             if self.watcher is not None:
                 get_logger().debug("Stopping weight watcher")
                 await self.watcher.stop()

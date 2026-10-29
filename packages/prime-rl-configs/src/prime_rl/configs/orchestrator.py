@@ -483,6 +483,17 @@ class SpeculativeDecodingConfig(BaseConfig):
     architecture and tensor shapes. A failed load restores the previous draft and reverts this value."""
 
 
+class CurriculumPlansConfig(BaseConfig):
+    """Per-step curriculum plans. The orchestrator records every Task it dispatches under
+    ``<output_dir>/curriculum``, and with ``[orchestrator.control]`` takes plans over its API."""
+
+    replay_from: Path | None = None
+    """A recorded run's ``curriculum/dispatch.jsonl`` to replay: each step dispatches the Tasks the record
+    lists for it, in order, then samples as configured, and a step the record lacks samples as configured.
+    A replaying run refuses plans. It repeats the Task schedule, not the outcomes: sampling and the envs
+    stay stochastic."""
+
+
 class OrchestratorConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
     """The model being trained: its model fields plus the client of the live
@@ -576,8 +587,9 @@ class OrchestratorConfig(BaseConfig):
     """BetterStack heartbeat configuration for monitoring training progress."""
 
     control: OrchestratorControlConfig | None = None
-    """Serve the orchestrator's control API (pause or checkpoint at a step the trainer
-    accepted, update the config live). If None, it takes no control requests."""
+    """Serve the orchestrator's control API: pause or checkpoint at a step the trainer
+    accepted, update the config live, and post per-step curriculum plans (``curriculum_plans``).
+    A step without a plan samples as configured. If None, it takes no control requests."""
 
     speculative_decoding: SpeculativeDecodingConfig | None = None
     """Draft model served by the policy engines. Auto-filled by the ``rl`` entrypoint from the inference
@@ -591,6 +603,8 @@ class OrchestratorConfig(BaseConfig):
         if self.speculative_decoding is not None and self.weight_broadcast.type == "modelexpress":
             raise ValueError("Draft swaps load with filesystem, NCCL or NIXL weight broadcasts, not modelexpress")
         return self
+
+    curriculum_plans: CurriculumPlansConfig = CurriculumPlansConfig()
 
     @model_validator(mode="after")
     def auto_setup_tokenizer(self):

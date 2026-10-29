@@ -6,7 +6,7 @@ import random
 import uuid
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import verifiers.v1 as vf
 
@@ -16,6 +16,9 @@ from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.types import TaskRequest
 from prime_rl.orchestrator.utils import episode_env_name
 from prime_rl.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.curriculum.plans import Plans
 
 
 class TrainSource(Reconfigurable):
@@ -34,11 +37,14 @@ class TrainSource(Reconfigurable):
             raise ValueError("TrainSource needs at least one train env")
 
         self.curricula: dict[str, Curriculum] = {}
+        self.tasks: dict[str, list[vf.Task] | None] = {}
+        """Each env's Tasks, or None for an env that streams them."""
         for env in self.envs:
             if env.tasks is None:
                 raise RuntimeError(f"env {env.name} not started")
             tasks = env.tasks if env.num_tasks is None else list(env.tasks)
             self.curricula[env.name] = Curriculum(env.config.curriculum, tasks)
+            self.tasks[env.name] = None if env.num_tasks is None else tasks
 
         self.streaming = {env.name for env in self.envs if env.num_tasks is None}
         self.env_names = [env.name for env in self.envs]
@@ -50,6 +56,8 @@ class TrainSource(Reconfigurable):
         # draw time, so a live group size change never resizes an open group.
         self.open_groups: dict[str, tuple[str, str, int]] = {}
         self.reopened: deque[tuple[str, vf.Task, int]] = deque()
+        self.plans: Plans | None = None
+        """Per-step curriculum plans set over the control API; None samples as configured."""
 
     def reconfigure(self, update: ConfigUpdate) -> None:
         ratios = {source.resolved_name: source.ratio for source in update.config.train.source}
@@ -60,12 +68,16 @@ class TrainSource(Reconfigurable):
         if self.reopened:
             env_name, task, group_size = self.reopened.popleft()
         else:
-            env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
-            task = next(self.curricula[env_name].sampler)
+            env_name, task = self.plans.draw(step) if self.plans is not None else self.draw()
             group_size = self.envs_by_name[env_name].config.group_size
         group_id = str(uuid.uuid4())
         self.open_groups[group_id] = (env_name, task.key, group_size)
         return TaskRequest(env_name=env_name, task=task, step=step, rollouts=group_size, group_id=group_id)
+
+    def draw(self) -> tuple[str, vf.Task]:
+        """An env by ratio, then its curriculum's next Task."""
+        env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
+        return env_name, next(self.curricula[env_name].sampler)
 
     def group_size(self, group_id: str) -> int | None:
         """The size an open group was drawn with; None once the group closed."""
@@ -85,6 +97,8 @@ class TrainSource(Reconfigurable):
         admitted = self.curricula[env_name].on_result(group)
         if not isinstance(admitted, bool):
             raise TypeError(f"Curriculum.on_result() must return bool, got {type(admitted).__name__}")
+        if self.plans is not None:
+            self.plans.observe(group)
         if admitted:
             self._admitted[env_name] += 1
         else:
