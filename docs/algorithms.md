@@ -78,6 +78,8 @@ type = "grpo"  # the default
 
 Every algorithm takes `drop_truncated = true` to ship no samples from a trace a turn or token limit cut off (`Trace.is_truncated`), as DAPO's overlong filtering does. A run cut off before it ends teaches only its middle, where continuing is right; under a turn cap the policy otherwise learns from long runs that never finish. A cohort algorithm still scores such traces with their group.
 
+Training leaves a rollout that hit a deadline out of the batch as an error. With `timeouts_as_failures = true`, a rollout its agent's own deadline stopped (`timeout.rollout`, stop condition `agent_timeout`) trains instead as a failed attempt: every reward 0, kept in its group, so its tokens take the group's advantage, negative when a sibling passed. A policy that loops until it is stopped then learns that looping fails. The 0 needs nothing the env does after the deadline, so an error in the task's finalize or scoring does not drop the rollout; a reply the deadline cut off is not trained. A rollout the policy never replied in, one another deadline stopped (setup, finalize, scoring), and one that failed for any other reason are still errors. `train/{agg,env}/effective/<agent>/timeouts_as_failures` counts the timed-out rollouts each step trained on.
+
 ### Customizing Components
 
 Every key beyond `type` is visibly your own assembly — there is no preset layer to diverge from. The vetted setting is the class defaults; what you set is what runs:
