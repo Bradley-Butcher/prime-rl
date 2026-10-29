@@ -359,14 +359,16 @@ Once paused, both keep serving the API until the run is stopped, so its owner ca
 With `--orchestrator.control`, the orchestrator's API also takes curriculum plans: which Tasks the next steps dispatch. A plan is keyed by a step, or `"default"` for every step without its own, and combines any of:
 
 - `tasks`: `[{"env": ..., "key": ...}]`, dispatched in order, one per group, from the step's first group (repeats allowed). After them the step samples.
-- `sources`: env weights in place of the configured ratios; an env it leaves out gets `"others"`, else 0.
+- `sources`: `{"<env>": share}`, shares in [0, 1]. A named env gets exactly its share of the step's sampled groups, and the envs it leaves out split the rest by their configured ratios: with ratios A 0.5, B 0.3, C 0.2, `{"A": 0.2}` gives A 0.2, B 0.48, C 0.32. Named shares summing to 1 leave the other envs nothing, so `{"A": 1}` samples only A. Shares over 1 in total, or naming every env with a total under 1, are refused.
 - `weights`: multipliers on a Task's weight within its env, keyed `task:<key>`, `label:<label>` or `pool:<pool>`. A Task's weight is its difficulty pool's weight (1 under the standard sampler) times every multiplier it matches; 0 excludes it, and an env whose every Task is excluded sits the step out. A label is a name in the Task data's `labels`, or `<field>=<value>` for one of its fields (`label:rung=R2`); `pool:unseen` matches Tasks no group has scored yet.
+
+Plans don't stack: each is relative to the config, never to an earlier step's plan, and every plan the API returns carries the `shares` each env gets under it.
 
 A step's plan is fixed when its first Task is dispatched, which is while the orchestrator collects that step, so its groups train in that step's batch or, off-policy, the next ones. A plan for a step whose dispatch has started is refused with 409, whose body names `current_dispatch_step` and `next_open_step`; `"step": "next"` takes the first open step atomically. A step without a plan samples exactly as configured.
 
 ```bash
 curl -X POST localhost:8041/v1/plans -H 'content-type: application/json' \
-  -d '{"step": "next", "author": "me", "note": "drill the write tasks", "plan": {"sources": {"fineract": 2, "others": 1}, "weights": {"label:kind=write": 3, "pool:easy": 0}}}'
+  -d '{"step": "next", "author": "me", "note": "drill the write tasks", "plan": {"sources": {"fineract": 0.4}, "weights": {"label:kind=write": 3, "pool:easy": 0}}}'
 curl localhost:8041/v1/plans            # every plan; GET or DELETE /v1/plans/{step|default} for one
 curl localhost:8041/v1/status           # dispatch step, trainer step, rollouts in flight, steps that used plans
 curl 'localhost:8041/v1/stats?step=12&env=fineract&limit=20'   # per env, label and Task; no step for the run's totals
