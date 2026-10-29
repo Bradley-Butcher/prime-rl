@@ -8,7 +8,8 @@ JSONL files in one directory keep the run repeatable:
 - ``plans.jsonl``: every plan posted or deleted, with its time, author and note.
 - ``dispatch.jsonl``: every Task dispatched, with its step and what chose it, and a summary line per step.
   Another run replays the schedule from it.
-- ``groups.jsonl``: every finalized group's outcome, which the stats are built from.
+- ``groups.jsonl``: every finalized group's outcome, which the stats are built from, with the reward shaping it
+  trained under (``prime_rl.orchestrator.curriculum.shaping``, whose changes ``shaping.jsonl`` records).
 
 A resume reads them back, keeping the dispatch and group records up to its step.
 """
@@ -33,6 +34,7 @@ from prime_rl.orchestrator.utils import episode_env_name, train_work
 from prime_rl.utils.logger import get_logger
 
 if TYPE_CHECKING:
+    from prime_rl.orchestrator.curriculum.shaping import Shaping
     from prime_rl.orchestrator.train_source import TrainSource
 
 Weight = Annotated[float, Field(ge=0, allow_inf_nan=False)]
@@ -282,6 +284,8 @@ class Plans:
         self.used: dict[int, Origin] = {}
         self.totals = Tally()
         self.by_step: dict[int, Tally] = {}
+        self.shaping: Shaping | None = None
+        """The run's live reward shaping, whose setting each group's outcome records."""
         self.lock = threading.Lock()
 
         directory.mkdir(parents=True, exist_ok=True)
@@ -465,6 +469,8 @@ class Plans:
     def observe(self, group: list[vf.Episode]) -> None:
         """Count a finalized group in the stats of the run and of the step it was dispatched at."""
         outcome = group_outcome(group)
+        if self.shaping is not None:
+            outcome |= self.shaping.record(group)
         with self.lock:
             self._tally(outcome)
             _append(self.groups_path, outcome)

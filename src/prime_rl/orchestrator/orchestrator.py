@@ -45,6 +45,7 @@ from prime_rl.control.controller import Controller, validate_update
 from prime_rl.control.plans import plan_router
 from prime_rl.control.server import ControlServer
 from prime_rl.control.types import ConfigUpdate, InvalidConfigError, Reconfigurable
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.routing import is_trainable
 from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
 from prime_rl.orchestrator.batch import BatchPacker
@@ -52,6 +53,7 @@ from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
 from prime_rl.orchestrator.concurrency import ConcurrencyController
 from prime_rl.orchestrator.curriculum.plans import Plans
+from prime_rl.orchestrator.curriculum.shaping import Shaping
 from prime_rl.orchestrator.dispatcher import Dispatcher, DispatcherMode
 from prime_rl.orchestrator.draft import DraftLoader
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
@@ -329,6 +331,13 @@ class Orchestrator:
             resume_step=self.resume_step,
             replay_from=config.curriculum_plans.replay_from,
         )
+        self.shaping = Shaping(
+            self.train_source.plans,
+            {env.name: env.algorithm for env in self.train_envs if isinstance(env.algorithm, GRPOAlgorithm)},
+            get_curriculum_dir(config.output_dir),
+            resume_step=self.resume_step,
+            replay_from=config.curriculum_plans.replay_from,
+        )
 
         get_logger().info("Waiting for policy inference pool to be ready")
         t0 = time.perf_counter()
@@ -480,7 +489,7 @@ class Orchestrator:
                 read_config=lambda: (self.config_revision, self.config),
                 check_config=self.check_config,
             )
-            routers = [plan_router(self.train_source.plans, self.control_status)]
+            routers = [plan_router(self.train_source.plans, self.control_status, self.shaping)]
             ControlServer(self.controller, config.control, routers=routers).start()
             self.component_tasks.append(asyncio.create_task(self.serve_control(), name="control"))
         # A failed component (e.g. the watcher after a weight update fails) cancels the step loop

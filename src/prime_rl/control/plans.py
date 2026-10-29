@@ -14,11 +14,15 @@ from prime_rl.orchestrator.curriculum.plans import (
     PlanRequest,
     Plans,
 )
+from prime_rl.orchestrator.curriculum.shaping import Shaping, ShapingRequest
 
 
-def plan_router(plans: Plans, run_status: Callable[[], dict[str, Any]] = dict) -> APIRouter:
+def plan_router(
+    plans: Plans, run_status: Callable[[], dict[str, Any]] = dict, shaping: Shaping | None = None
+) -> APIRouter:
     """Routes to post, read and delete plans, and to read the run's status and stats. ``run_status`` adds the
-    orchestrator's own state to ``/v1/status``."""
+    orchestrator's own state to ``/v1/status``. With ``shaping``, also the routes to change and read the reward
+    shaping, whose setting ``/v1/status`` then shows."""
     router = APIRouter()
 
     @router.post("/v1/plans")
@@ -39,7 +43,17 @@ def plan_router(plans: Plans, run_status: Callable[[], dict[str, Any]] = dict) -
 
     @router.get("/v1/status")
     async def get_status() -> dict[str, Any]:
-        return plans.status() | run_status()
+        return plans.status() | ({"shaping": shaping.status()} if shaping is not None else {}) | run_status()
+
+    if shaping is not None:
+
+        @router.post("/v1/shaping")
+        async def set_shaping(request: ShapingRequest) -> Any:
+            return _respond(lambda: shaping.set(request))
+
+        @router.get("/v1/shaping")
+        async def get_shaping() -> dict[str, Any]:
+            return shaping.describe()
 
     @router.get("/v1/stats")
     async def get_stats(
