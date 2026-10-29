@@ -178,6 +178,20 @@ class BaseAlgoConfig(BaseConfig):
     never finish, and learns to keep going. A cohort algorithm still scores
     such traces with their group; they only ship no samples."""
 
+    timeouts_as_failures: bool = False
+    """Train a rollout its agent's own deadline stopped (verifiers'
+    ``timeout.rollout``, stop condition ``agent_timeout``) as a failed attempt:
+    every reward 0, kept in its group, so a cohort algorithm gives its sampled
+    tokens the group's advantage, negative when a sibling passed. Off, training
+    leaves a timed-out rollout out as an error, so a policy that loops until it
+    is stopped never learns that looping fails. The 0 needs nothing the env
+    does after the deadline: an error in the task's finalize or scoring then
+    does not drop the rollout. A reply the deadline cut off mid-generation is
+    not trained. Still left out as errors: a rollout the policy never replied
+    in, one stopped by any other deadline (setup, finalize, scoring), and one
+    that failed for any other reason (a task, model or harness error). Eval
+    scores a timed-out rollout with the env's own reward either way."""
+
     @model_validator(mode="after")
     def validate_sampling_source(self):
         """The on-policy loss types (rl, ref_kl) need the live policy's own

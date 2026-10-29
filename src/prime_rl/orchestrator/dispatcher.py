@@ -668,13 +668,12 @@ class Dispatcher:
             )
             return
 
+        if meta.kind == "train":
+            # Training keeps a timed-out rollout out of the batch as an error, or with
+            # ``timeouts_as_failures`` scores an agent timeout 0. Eval keeps it as a scored outcome.
+            assert self.train_envs is not None
+            self.train_envs.get(meta.env_name).algorithm.settle_timeouts(episode)
         for trace in episode.traces:
-            if trace.is_timeout and not trace.has_error and meta.kind == "train":
-                # Training keeps a timed-out rollout out of the batch: an error,
-                # like any other failure. Eval keeps it as a scored outcome.
-                trace.errors.append(vf.Error(type="Timeout", message=f"Trace stopped by {trace.stop_condition}"))
-                trace.ok = False
-                episode.ok = False
             if trace.has_error:
                 self.metrics.record_error(kind=meta.kind, env_name=meta.env_name)
                 if trace.last_error is not None:
