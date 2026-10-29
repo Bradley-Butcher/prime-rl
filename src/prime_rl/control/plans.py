@@ -45,9 +45,11 @@ def plan_router(plans: Plans, run_status: Callable[[], dict[str, Any]] = dict) -
     async def get_stats(
         step: int | None = Query(None, ge=1),
         env: str | None = None,
+        label: list[str] | None = Query(None),
         limit: int = Query(100, ge=0),
+        top_labels: int = Query(20, ge=0),
     ) -> dict[str, Any]:
-        return plans.stats(step=step, env=env, limit=limit)
+        return plans.stats(step=step, env=env, labels=label, limit=limit, top_labels=top_labels)
 
     return router
 

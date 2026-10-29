@@ -18,13 +18,12 @@ POOLS = {
     "hard": DifficultyPoolConfig(threshold=0.25, weight=1.0),
     "easy": DifficultyPoolConfig(threshold=1.0, weight=1.0),
 }
+LABELS = {0: ["fast"], 2: ["hard", "hops:1"]}
 
 
 def make_source() -> TrainSource:
     """Env ``a`` cycles four Tasks with ``kind`` and ``labels``; env ``b`` samples four by difficulty pool."""
-    a = [
-        vf.Task(vf.WireTaskData(idx=i, kind="read" if i % 2 else "write", labels=["fast"] * (i == 0))) for i in range(4)
-    ]
+    a = [vf.Task(vf.WireTaskData(idx=i, kind="read" if i % 2 else "write", labels=LABELS.get(i, []))) for i in range(4)]
     b = [vf.Task(vf.WireTaskData(idx=i, prompt="b")) for i in range(4)]
     pool = CurriculumConfig(sampler=DifficultyPoolSamplerConfig(pools=POOLS))
     envs = [
@@ -198,7 +197,7 @@ def test_plans_records_and_stats_resume_up_to_their_step(tmp_path):
     ]
     assert [record["step"] for record in dispatched(tmp_path, "step")] == [1, 2]
     assert resumed.status()["plan_steps"] == {"step": [[2, 2]], "default": [[1, 1]], "replay": []}
-    assert resumed.stats()["tasks"] == [{"key": task.key, "env": "a", "reward": 0.5, "visits": 2}]
+    assert resumed.stats()["tasks"] == [{"key": task.key, "env": "a", "reward": 0.5, "visits": 2, "labels": ["fast"]}]
     assert resumed.stats(step=3)["envs"] == {}
     with pytest.raises(PlanConflictError):
         resumed.set(2, Plan(sources={"a": 1.0}))
@@ -251,7 +250,7 @@ def test_plan_routes(tmp_path):
         "timeout_share": 0.0,
         "error_share": 0.0,
     }
-    assert stats["tasks"] == [{"key": task.key, "env": "a", "reward": 0.5, "visits": 1}]
+    assert stats["tasks"] == [{"key": task.key, "env": "a", "reward": 0.5, "visits": 1, "labels": ["fast"]}]
     assert client.get("/v1/stats", params={"limit": 0, "env": "a"}).json()["tasks_total"] == 1
     assert client.post("/v1/actions", json={"type": "pause", "step": 5}).status_code == 202
 
@@ -314,3 +313,42 @@ def test_replay_dispatches_the_recorded_tasks_per_step(tmp_path):
     assert [record["origin"] for record in dispatched(tmp_path / "replay")] == ["replay"] * 16 + [None] * 2
     with pytest.raises(PlanConflictError):
         replay.plans.set("next", Plan(sources={"a": 1.0}))
+
+
+def test_stats_give_each_task_its_labels(tmp_path):
+    source = planned_source(tmp_path)
+    a = source.tasks["a"]
+    for task in (a[1], a[2]):
+        source.on_result(make_group(task, env="a", step=1, rewards=[1.0]))
+
+    assert source.plans.stats()["tasks"] == [
+        {"key": a[2].key, "env": "a", "reward": 1.0, "visits": 1, "labels": ["hard", "hops:1"]},
+        {"key": a[1].key, "env": "a", "reward": 1.0, "visits": 1},
+    ]
+
+
+def test_stats_aggregate_groups_by_label(tmp_path):
+    source = planned_source(tmp_path)
+    client = TestClient(create_app(Controller(requires_step=True), [plan_router(source.plans)]))
+    a = source.tasks["a"]
+    source.on_result(make_group(a[2], env="a", step=1, rewards=[0.0, 1.0]))
+    source.on_result(make_group(a[2], env="a", step=2, rewards=[1.0, 1.0]))
+    source.on_result(make_group(a[0], env="a", step=2, rewards=[0.0, 0.0]))
+
+    top = client.get("/v1/stats").json()["labels"]
+    chosen = client.get("/v1/stats", params=[("label", "hops:1"), ("label", "slow")]).json()
+
+    assert top == {
+        "hard": {"groups": 2, "mixed_share": 0.5, "mean_reward": 0.75},
+        "hops:1": {"groups": 2, "mixed_share": 0.5, "mean_reward": 0.75},
+        "fast": {"groups": 1, "mixed_share": 0.0, "mean_reward": 0.0},
+    }
+    assert chosen["labels"] == {
+        "hops:1": {"groups": 2, "mixed_share": 0.5, "mean_reward": 0.75},
+        "slow": {"groups": 0, "mixed_share": None, "mean_reward": None},
+    }
+    assert chosen["tasks"] == []
+    assert [task["key"] for task in client.get("/v1/stats", params={"label": "hard"}).json()["tasks"]] == [a[2].key]
+    assert client.get("/v1/stats", params={"step": 2, "top_labels": 1}).json()["labels"] == {
+        "fast": {"groups": 1, "mixed_share": 0.0, "mean_reward": 0.0}
+    }

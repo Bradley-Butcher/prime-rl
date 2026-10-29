@@ -141,6 +141,10 @@ def group_outcome(group: list[vf.Episode]) -> dict[str, Any]:
     }
 
 
+LABEL_STATS = ("groups", "mixed_share", "mean_reward")
+"""What ``/v1/stats`` gives per label, of an env's stats."""
+
+
 @dataclass
 class EnvTally:
     """Finalized groups of one env."""
@@ -178,13 +182,16 @@ class EnvTally:
 
 @dataclass
 class Tally:
-    """Finalized groups by env, and by Task (most recently finalized last)."""
+    """Finalized groups by env, by the labels of their Tasks, and by Task (most recently finalized last)."""
 
     envs: dict[str, EnvTally] = field(default_factory=dict)
+    labels: dict[str, EnvTally] = field(default_factory=dict)
     tasks: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
-    def add(self, outcome: dict[str, Any]) -> None:
+    def add(self, outcome: dict[str, Any], labels: Iterable[str] = ()) -> None:
         self.envs.setdefault(outcome["env"], EnvTally()).add(outcome)
+        for label in labels:
+            self.labels.setdefault(label, EnvTally()).add(outcome)
         task_id = (outcome["env"], outcome["key"])
         visits = self.tasks.pop(task_id, {"visits": 0})["visits"]
         self.tasks[task_id] = {"reward": outcome["reward"], "visits": visits + 1}
@@ -238,6 +245,13 @@ class Plans:
         self.tasks = {
             name: {task.key: task for task in tasks} for name, tasks in source.tasks.items() if tasks is not None
         }
+        self.labels = {
+            (name, key): list(labels)
+            for name, keyed in self.tasks.items()
+            for key, task in keyed.items()
+            if (labels := getattr(task.data, "labels", None))
+        }
+        """Each Task's labels, for those whose data has them."""
         self.pools = {
             name: {*curriculum.sampler.pools, "unseen"}
             for name, curriculum in source.curricula.items()
@@ -360,22 +374,41 @@ class Plans:
                 },
             }
 
-    def stats(self, *, step: int | None = None, env: str | None = None, limit: int = 100) -> dict[str, Any]:
-        """Finalized groups by env and by Task, most recently finalized first: the run's, or those
-        dispatched at ``step``."""
+    def stats(
+        self,
+        *,
+        step: int | None = None,
+        env: str | None = None,
+        labels: list[str] | None = None,
+        limit: int = 100,
+        top_labels: int = 20,
+    ) -> dict[str, Any]:
+        """Finalized groups by env, by label and by Task, most recently finalized first: the run's, or those
+        dispatched at ``step``. ``labels`` names the labels to aggregate, across envs, and keeps the Tasks
+        carrying all of them; without it the ``top_labels`` labels with the most groups are aggregated."""
         with self.lock:
             tally = self.totals if step is None else self.by_step.get(step, Tally())
-            tasks = [
-                {"key": key, "env": env_name, "reward": _round(task["reward"]), "visits": task["visits"]}
-                for (env_name, key), task in reversed(tally.tasks.items())
-                if env is None or env_name == env
-            ]
+            wanted = set(labels or ())
+            tasks = []
+            for (env_name, key), task in reversed(tally.tasks.items()):
+                task_labels = self.labels.get((env_name, key), [])
+                if (env is None or env_name == env) and wanted <= set(task_labels):
+                    entry = {"key": key, "env": env_name, "reward": _round(task["reward"]), "visits": task["visits"]}
+                    tasks.append(entry | ({"labels": task_labels} if task_labels else {}))
+            if labels:
+                chosen = [(label, tally.labels.get(label, EnvTally())) for label in labels]
+            else:
+                chosen = sorted(tally.labels.items(), key=lambda item: (-item[1].groups, item[0]))[:top_labels]
             return {
                 "step": step,
                 "envs": {
                     name: env_tally.summary()
                     for name, env_tally in sorted(tally.envs.items())
                     if env is None or name == env
+                },
+                "labels": {
+                    label: {name: value for name, value in label_tally.summary().items() if name in LABEL_STATS}
+                    for label, label_tally in chosen
                 },
                 "tasks": tasks[:limit],
                 "tasks_total": len(tasks),
@@ -507,8 +540,9 @@ class Plans:
         return self.source.rng.choices(tasks, weights=weights, k=1)[0]
 
     def _tally(self, outcome: dict[str, Any]) -> None:
-        self.totals.add(outcome)
-        self.by_step.setdefault(outcome["step"], Tally()).add(outcome)
+        labels = self.labels.get((outcome["env"], outcome["key"]), ())
+        self.totals.add(outcome, labels)
+        self.by_step.setdefault(outcome["step"], Tally()).add(outcome, labels)
 
     def _check_open(self, key: PlanKey) -> None:
         if self.replay is not None:
