@@ -12,7 +12,7 @@ from verifiers.v1.trace import ModelCall
 from verifiers.v1.types import AssistantMessage, Tool, ToolMessage, Usage, UserMessage
 
 from prime_rl.configs.algorithm import GRPOAlgoConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.configs.orchestrator import BatchSelectionConfig, OrchestratorConfig
 from prime_rl.orchestrator.algo.base import Algorithm
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.train_sink import TrainSink
@@ -86,8 +86,13 @@ def episode(traces, *, group="g", version=0, ok=True):
     )
 
 
-def sink(*, constant=True, admitted=True, batch_size=100, group_size=1, algorithm=None):
-    config = OrchestratorConfig(batch_size=batch_size, constant_trainer_batch_size=constant, max_off_policy_steps=1)
+def sink(*, constant=True, admitted=True, batch_size=100, group_size=1, algorithm=None, selection=None, exits=None):
+    config = OrchestratorConfig(
+        batch_size=batch_size,
+        constant_trainer_batch_size=constant,
+        max_off_policy_steps=1,
+        batch_selection=selection,
+    )
     env = SimpleNamespace(
         config=SimpleNamespace(group_size=group_size, sampling=SimpleNamespace(temperature=1.0)),
         requires_sampling_masks=False,
@@ -100,6 +105,7 @@ def sink(*, constant=True, admitted=True, batch_size=100, group_size=1, algorith
         progress=Progress(),
         batch_size=batch_size,
         on_result=lambda group: admitted,
+        on_pool_exit=exits.extend if exits is not None else None,
     )
 
 
@@ -319,5 +325,84 @@ def test_with_timeouts_as_failures_errors_and_timeouts_without_a_reply_are_still
 
         assert set(s.pending_batch) == {passed.id, failed.id}
         assert all(t.has_error for t in (task_error, never_replied, setup_timeout))
+
+    asyncio.run(run())
+
+
+def group(name, rewards, *, version=0):
+    return episode([trace(reward=reward) for reward in rewards], group=name, version=version)
+
+
+def groups_of(batch):
+    return {episode.group.id for episode in batch.cohort.episodes}
+
+
+def test_batch_selection_trains_the_most_informative_groups_and_carries_the_rest():
+    async def run():
+        exits = []
+        s = sink(batch_size=8, selection=BatchSelectionConfig(oversample=1.5), exits=exits)
+        # While a batch ships, groups keep pooling up to the cap (12 rollouts) and none is cut.
+        s.shipping = True
+        for name, rewards in [("a", [1, 1, 1, 0]), ("b", [1, 0, 1, 0]), ("c", [1, 0, 0, 0]), ("d", [1, 1, 0, 0])]:
+            assert await s.add(group(name, rewards)) is None
+        # c scores as a does (3/16), and the newer of the two goes when d takes the pool past its cap.
+        assert [(record["group"], record["fate"]) for record in exits] == [("c", "displaced")]
+        assert len(s.pending_batch) == 12 and "c" not in {ep.group.id for ep in s.episode_by_trace.values()}
+
+        s.shipping = False
+        batch = await s.take_batch()
+        assert groups_of(batch) == {"b", "d"} and len(batch.samples) == 8
+        assert batch.selection.metrics() == {
+            "selection/pool": 3.0,
+            "selection/candidates": 4.0,
+            "selection/selected": 2.0,
+            "selection/carried": 1.0,
+            "selection/stale": 0.0,
+            "selection/displaced": 1.0,
+            "selection/score/selected": pytest.approx(0.25),
+            "selection/score/passed": pytest.approx(3 / 16),
+        }
+        assert [(r["group"], r["fate"], r["rollouts"]) for r in batch.selection.records(1)] == [
+            ("b", "trained", 4),
+            ("d", "trained", 4),
+        ]
+
+        # The group passed over trains in the next batch, ahead of an equally scored newer one.
+        batch = await s.add(group("e", [0, 0, 0, 1]))
+        assert groups_of(batch) == {"a", "e"}
+        assert [(r["group"], r["passed"]) for r in batch.selection.records(2)] == [("a", 1), ("e", 0)]
+        assert not s.pending_batch and not s.episode_by_trace and s.pool.size == 0
+
+    asyncio.run(run())
+
+
+def test_batch_selection_drops_a_pooled_group_once_it_is_too_stale_to_train():
+    async def run():
+        exits = []
+        s = sink(batch_size=8, selection=BatchSelectionConfig(oversample=2), exits=exits)
+        s.progress.step = 3  # trains v2; max_off_policy_steps = 1 keeps v1 and later
+        s.shipping = True
+        await s.add(group("old", [1, 0, 0, 0], version=1))
+        await s.add(group("b", [1, 0, 1, 0], version=2))
+        await s.add(group("c", [0, 1, 0, 1], version=2))
+        s.shipping = False
+        assert groups_of(await s.take_batch()) == {"b", "c"}
+
+        s.progress.step = 4
+        assert await s.take_batch() is None
+        assert [(r["group"], r["fate"], r["step"], r["passed"], r["rollouts"], r["score"]) for r in exits] == [
+            ("old", "stale", 4, 1, 4, 0.1875)
+        ]
+        assert not s.pending_batch and not s.episode_by_trace and s.pool.size == 0
+
+        await s.add(group("d", [1, 0, 0, 1], version=3))
+        batch = await s.add(group("e", [1, 0, 0, 1], version=3))
+        assert groups_of(batch) == {"d", "e"} and batch.selection.metrics()["selection/stale"] == 1.0
+
+        # A run that stops training discards what is still pooled.
+        await s.add(group("f", [1, 0, 0, 1], version=3))
+        s.discard_queued()
+        assert [(r["group"], r["fate"]) for r in exits[1:]] == [("f", "discarded")]
+        assert s.pool.size == 0
 
     asyncio.run(run())

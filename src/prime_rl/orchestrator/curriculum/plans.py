@@ -11,6 +11,9 @@ JSONL files in one directory keep the run repeatable:
 - ``groups.jsonl``: every finalized group's outcome, which the stats are built from, with the reward shaping it
   trained under (``prime_rl.orchestrator.curriculum.shaping``, whose changes ``shaping.jsonl`` records).
 
+With ``batch_selection``, ``selection.jsonl`` holds how each admitted group left the selection pool: trained at a
+step, or dropped (``prime_rl.orchestrator.selection``). Its ``step`` is the step it left at.
+
 A resume reads them back, keeping the dispatch and group records up to its step.
 """
 
@@ -292,12 +295,15 @@ class Plans:
         self.plans_path = directory / "plans.jsonl"
         self.dispatch_path = directory / "dispatch.jsonl"
         self.groups_path = directory / "groups.jsonl"
+        self.selection_path = directory / "selection.jsonl"
         self._read_plans(fresh=resume_step is None)
         for record in _keep_records(self.dispatch_path, self.dispatch_step):
             if record["type"] == "task" and record["origin"] is not None:
                 self.used[record["step"]] = record["origin"]
         for outcome in _keep_records(self.groups_path, self.dispatch_step):
             self._tally(outcome)
+        if self.selection_path.exists():
+            _keep_records(self.selection_path, self.dispatch_step)
 
     # ── the API's side ─────────────────────────────────────────────────────
 
@@ -474,6 +480,12 @@ class Plans:
         with self.lock:
             self._tally(outcome)
             _append(self.groups_path, outcome)
+
+    def record_selection(self, records: list[dict[str, Any]]) -> None:
+        """Append how groups left the batch-selection pool."""
+        with self.lock:
+            for record in records:
+                _append(self.selection_path, record)
 
     def close(self) -> None:
         """Summarize the step dispatching now, as the next step's dispatch would."""

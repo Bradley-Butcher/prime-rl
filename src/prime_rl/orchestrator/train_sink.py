@@ -6,11 +6,14 @@ readiness check the sink sweeps ``pending_batch`` for traces past
 ``max_off_policy_steps`` — this sweep, not the dispatcher's in-flight cancel,
 is what guarantees nothing stale ships. Completed groups become numeric
 observations; only queued traces retain verifier objects. The consumer drains
-``take_rollout_window(force=True)`` before shipping a batch."""
+``take_rollout_window(force=True)`` before shipping a batch. With
+``batch_selection``, queued groups form a ``CandidatePool`` and each batch takes
+its highest-scored groups (``prime_rl.orchestrator.selection``)."""
 
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 
@@ -21,6 +24,7 @@ from prime_rl.orchestrator.algo.base import iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import stamp_loss_routing
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.metrics import RolloutWindow, TrainEpisodes
+from prime_rl.orchestrator.selection import SCORES, Candidate, CandidatePool, Exit, Fate
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.orchestrator.types import DispatchFailure, GroupCancellation, Progress, TrainBatch
 from prime_rl.orchestrator.utils import episode_env_name, episode_group_id, min_fresh_version, train_work
@@ -68,6 +72,7 @@ class TrainSink:
         progress: Progress,
         batch_size: int,
         on_result: Callable[[list[vf.Episode]], bool] | None = None,
+        on_pool_exit: Callable[[list[dict]], None] | None = None,
     ) -> None:
         self.config = config
         self.tokenizer = tokenizer
@@ -75,6 +80,13 @@ class TrainSink:
         self.progress = progress
         self.batch_size = batch_size
         self.on_result = on_result
+        # Records groups that leave the selection pool other than in a batch.
+        self.on_pool_exit = on_pool_exit
+        selection = config.batch_selection
+        self.pool = CandidatePool(math.ceil(selection.oversample * batch_size)) if selection is not None else None
+        # Set while the consumer ships a batch: groups keep queueing, but no
+        # batch is cut until that one has shipped.
+        self.shipping = False
 
         self.rollout_window = RolloutWindow()
         self.pending_groups: dict[str, list[vf.Episode]] = defaultdict(list)
@@ -150,9 +162,11 @@ class TrainSink:
 
     async def take_batch(self) -> TrainBatch | None:
         """Sweep stale queued traces, then cut a batch if the survivors still
-        meet the threshold."""
+        meet the threshold and no batch is shipping."""
         self._drop_stale()
-        return await self.process_batch() if len(self.pending_batch) >= self.batch_size else None
+        if self.shipping or len(self.pending_batch) < self.batch_size:
+            return None
+        return await self.process_batch()
 
     def _drop_stale(self, trace_ids: Iterable[str] | None = None) -> None:
         """Void queued traces past ``max_off_policy_steps``. The batch being
@@ -175,7 +189,7 @@ class TrainSink:
         min_version = min_fresh_version(self.progress.step, self.config.max_off_policy_steps)
         if min_version <= 0:
             return
-        dropped = 0
+        dropped: list[str] = []
         for trace_id in trace_ids:
             episode = self.episode_by_trace[trace_id]
             policy = train_work(episode).policy
@@ -183,13 +197,15 @@ class TrainSink:
                 continue
             del self.pending_batch[trace_id]
             del self.episode_by_trace[trace_id]
-            dropped += 1
+            dropped.append(trace_id)
         if dropped:
-            self.rollout_window.metrics.count("off_policy/dropped", float(dropped))
+            self.rollout_window.metrics.count("off_policy/dropped", float(len(dropped)))
             get_logger().warning(
-                f"Dropped {dropped} queued traces past max_off_policy_steps={self.config.max_off_policy_steps}. "
+                f"Dropped {len(dropped)} queued traces past max_off_policy_steps={self.config.max_off_policy_steps}. "
                 "Consider increasing it to avoid this."
             )
+            if self.pool is not None:
+                self._leave_pool(self.pool.drop(dropped, "stale"), "stale")
 
     async def process_episode(self, episode: vf.Episode) -> None:
         """Run rollout-local algorithm work on one native episode."""
@@ -287,6 +303,33 @@ class TrainSink:
             return
         self.zero_output_units = 0
         self.reported_zero_output_windows = 0
+        if self.pool is not None:
+            self._pool_group(group, env_name, survivors, [tid for tid in samples_by_trace if tid in queued])
+
+    def _pool_group(self, group: list[vf.Episode], env_name: str, survivors: list[vf.Trace], queued: list[str]) -> None:
+        """Pool a queued group as a selection candidate, scored over the rewards of its trainable rollouts."""
+        assert self.pool is not None and self.config.batch_selection is not None
+        work = train_work(group[0])
+        candidate = Candidate(
+            group_id=episode_group_id(group[0]),
+            env_name=env_name,
+            task_key=group[0].task.key,
+            step=work.step,
+            version=work.policy.start if work.policy is not None else None,
+            score=SCORES[self.config.batch_selection.score]([trace.reward for trace in survivors]),
+            trace_ids=queued,
+        )
+        self._leave_pool(self.pool.add(candidate), "displaced")
+
+    def _leave_pool(self, exits: list[Exit], fate: Fate) -> None:
+        """Release the queued traces of groups that left the pool other than in a batch, and record them."""
+        for _, trace_ids in exits:
+            for trace_id in trace_ids:
+                self.pending_batch.pop(trace_id, None)
+                self.episode_by_trace.pop(trace_id, None)
+        if exits and self.on_pool_exit is not None:
+            step = self.progress.step
+            self.on_pool_exit([candidate.record(step=step, fate=fate, rollouts=len(ids)) for candidate, ids in exits])
 
     def _record_group(
         self,
@@ -318,6 +361,8 @@ class TrainSink:
         """Release accepted traces that cannot ship after training stops."""
         if self.pending_batch:
             self.rollout_window.metrics.count("rollout/queued/cancelled", float(len(self.pending_batch)))
+        if self.pool is not None:
+            self._leave_pool(self.pool.drop(list(self.pool.group_of), "discarded"), "discarded")
         self.pending_batch.clear()
         self.episode_by_trace.clear()
 
@@ -346,7 +391,11 @@ class TrainSink:
         )
 
     async def process_batch(self) -> TrainBatch:
-        selected = list(self.pending_batch.items())[: self.batch_size]
+        selection = self.pool.select(self.batch_size) if self.pool is not None else None
+        if selection is None:
+            selected = list(self.pending_batch.items())[: self.batch_size]
+        else:
+            selected = [(trace_id, self.pending_batch[trace_id]) for trace_id in selection.trace_ids]
 
         selected_by_trace = dict(selected)
         selected_ids = set(selected_by_trace)
@@ -381,4 +430,4 @@ class TrainSink:
         ]
         cohort = TrainEpisodes(cohort_episodes, sampled_trace_ids=shipped_ids)
 
-        return TrainBatch(cohort=cohort, samples=samples)
+        return TrainBatch(cohort=cohort, samples=samples, selection=selection)

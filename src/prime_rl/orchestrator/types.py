@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     import verifiers.v1 as vf
 
     from prime_rl.orchestrator.metrics import EvalEpisodes, TrainEpisodes
+    from prime_rl.orchestrator.selection import Selection
 
 
 @dataclass
@@ -136,6 +137,8 @@ class TrainBatch:
 
     cohort: TrainEpisodes
     samples: list[TrainingSample]
+    selection: Selection | None = None
+    """How the batch was chosen from the pool, with ``batch_selection``."""
 
 
 @dataclass

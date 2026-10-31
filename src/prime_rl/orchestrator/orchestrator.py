@@ -7,6 +7,8 @@ and drives the pipeline. Components are single-purpose:
 - ``TrainSink`` ingests train rollouts (score → admission → sample compilation)
   and returns a ``TrainBatch`` when the threshold is met. Completed groups
   contribute scalar metrics to finite rollout windows regardless of admission.
+  With ``batch_selection``, it keeps ingesting while a batch waits on the
+  trainer, and each batch takes its pool's most informative groups.
 - ``EvalSink`` ingests eval rollouts and returns an ``EvalBatch`` (the full
   returned cohort) on epoch completion.
 - ``TrainEpisodes`` / ``EvalEpisodes`` preserve episode boundaries and build per-step metrics.
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 
     from prime_rl.orchestrator.ckpt import CheckpointManager
     from prime_rl.transports.batch.base import BatchSender
+    from prime_rl.transports.batch.types import MicroBatch
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive imports
 from prime_rl import monitors
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -56,10 +59,12 @@ from prime_rl.orchestrator.eval_source import EvalSource
 from prime_rl.orchestrator.inference_metrics import InferenceMetricsCollector
 from prime_rl.orchestrator.metrics import TrainEpisodes, dispatch_failure_metrics
 from prime_rl.orchestrator.periodic_logger import PeriodicLogger
+from prime_rl.orchestrator.selection import Fate
 from prime_rl.orchestrator.train_sink import TrainSink
 from prime_rl.orchestrator.train_source import TrainSource
 from prime_rl.orchestrator.types import (
     DispatchFailure,
+    DispatchResult,
     EvalBatch,
     GroupCancellation,
     Policy,
@@ -379,6 +384,7 @@ class Orchestrator:
             progress=self.progress,
             batch_size=config.batch_size,
             on_result=self.train_source.on_result,
+            on_pool_exit=self.train_source.plans.record_selection,
         )
 
         self.eval_sink = EvalSink(eval_envs=self.eval_envs) if self.eval_envs is not None else None
@@ -511,13 +517,7 @@ class Orchestrator:
         await self.wait_for_version(self.config.max_steps, reason="before shutdown")
 
     async def main_loop(self) -> None:
-        """Consume dispatcher results and route them to the train / eval sink.
-
-        Native episodes are persisted as verifier artifacts. Dispatch failures
-        and group cancellations remain internal accounting events.
-
-        The sinks return a finalized batch (or ``None``); we just dispatch on
-        the result."""
+        """Consume dispatcher results and route them to the train / eval sink."""
         while not self.stopped.is_set():
             self._raise_if_component_stopped()
             if self.draining and self.dispatcher.is_idle:
@@ -530,46 +530,55 @@ class Orchestrator:
             except asyncio.TimeoutError:
                 self._raise_if_component_stopped()
                 continue
+            await self.ingest(item)
 
-            if isinstance(item, GroupCancellation):
-                assert item.kind == "train"  # eval groups are never dropped
-                train_batch = await self.train_sink.cancel(item)
-                await self.handle_train_result(train_batch)
-                continue
-            if isinstance(item, DispatchFailure):
-                if item.kind == "eval":
-                    assert self.eval_sink is not None
-                    eval_batch = self.eval_sink.fail(item)
-                    if eval_batch is not None:
-                        await self.finalize_eval_batch(eval_batch)
-                else:
-                    train_batch = await self.train_sink.fail(item)
-                    await self.handle_train_result(train_batch)
-                continue
-            episode = item
+    async def ingest(self, item: DispatchResult) -> None:
+        """Route one dispatcher result to the train / eval sink.
 
-            # Every completed rollout — errored, rejected, or never batched — lands in the
-            # ``all`` trace file the moment it arrives, so it survives crashes and drains.
-            # Train rollouts belong to the batch window currently collecting (``progress.step``),
-            # eval rollouts to the step whose eval triggered them.
-            if episode.run is None:
-                raise ValueError("Dispatched episode is missing run identity")
-            if not isinstance(episode.run, vf.TrainRunInfo):
-                raise ValueError("Orchestrated episode is missing training-run provenance")
-            kind = episode.run.work.type
-            step = episode.run.work.step if kind == "eval" else self.progress.step
-            stamp_arrival([episode], kind, step)
-            await monitors.log([episode], step, kind, "all")
+        Native episodes are persisted as verifier artifacts. Dispatch failures
+        and group cancellations remain internal accounting events.
 
-            if kind == "eval":
-                assert self.eval_sink is not None  # eval rollouts only emitted when eval is configured
-                eval_batch = self.eval_sink.add(episode)
+        The sinks return a finalized batch (or ``None``); we just dispatch on
+        the result."""
+        if isinstance(item, GroupCancellation):
+            assert item.kind == "train"  # eval groups are never dropped
+            train_batch = await self.train_sink.cancel(item)
+            await self.handle_train_result(train_batch)
+            return
+        if isinstance(item, DispatchFailure):
+            if item.kind == "eval":
+                assert self.eval_sink is not None
+                eval_batch = self.eval_sink.fail(item)
                 if eval_batch is not None:
                     await self.finalize_eval_batch(eval_batch)
-                continue
+            else:
+                train_batch = await self.train_sink.fail(item)
+                await self.handle_train_result(train_batch)
+            return
+        episode = item
 
-            train_batch = await self.train_sink.add(episode)
-            await self.handle_train_result(train_batch)
+        # Every completed rollout — errored, rejected, or never batched — lands in the
+        # ``all`` trace file the moment it arrives, so it survives crashes and drains.
+        # Train rollouts belong to the batch window currently collecting (``progress.step``),
+        # eval rollouts to the step whose eval triggered them.
+        if episode.run is None:
+            raise ValueError("Dispatched episode is missing run identity")
+        if not isinstance(episode.run, vf.TrainRunInfo):
+            raise ValueError("Orchestrated episode is missing training-run provenance")
+        kind = episode.run.work.type
+        step = episode.run.work.step if kind == "eval" else self.progress.step
+        stamp_arrival([episode], kind, step)
+        await monitors.log([episode], step, kind, "all")
+
+        if kind == "eval":
+            assert self.eval_sink is not None  # eval rollouts only emitted when eval is configured
+            eval_batch = self.eval_sink.add(episode)
+            if eval_batch is not None:
+                await self.finalize_eval_batch(eval_batch)
+            return
+
+        train_batch = await self.train_sink.add(episode)
+        await self.handle_train_result(train_batch)
 
     async def handle_train_result(self, batch: TrainBatch | None) -> None:
         if self.heart is not None:
@@ -582,6 +591,7 @@ class Orchestrator:
         if self.draining or self.stopped.is_set():
             if batch is not None:
                 self.train_sink.rollout_window.metrics.count("rollout/queued/cancelled", float(batch.cohort.num_traces))
+                self.record_selection(batch, self.progress.step, fate="discarded")
             self.train_sink.discard_queued()
 
     def take_rollout_metrics(self) -> dict[str, float]:
@@ -645,11 +655,13 @@ class Orchestrator:
         # step, or a lowered ``max_steps``): never ship beyond the budget.
         if config.max_steps is not None and step > config.max_steps:
             self.train_sink.rollout_window.metrics.count("rollout/queued/cancelled", float(batch.cohort.num_traces))
+            self.record_selection(batch, step, fate="discarded")
             await self.start_draining(f"Step {step} exceeds max_steps={config.max_steps}")
             return
 
         if not batch.samples:
             get_logger().warning(f"Step {step}: skipping empty train batch after zero-advantage pruning")
+            self.record_selection(batch, step, fate="discarded")
             return
         # Sink-to-sink cycle time — the actual time between batches, not
         # including the orchestrator's ship I/O (overlapped with the
@@ -685,8 +697,9 @@ class Orchestrator:
         # Sending blocks until every trainer rank requested the batch, so the wait is the time
         # the orchestrator spent waiting on the trainer for the next policy.
         send_start_time = time.perf_counter()
-        send_batch_time = await self.sender.send(micro_batch_grid)
+        send_batch_time = await self.ship(micro_batch_grid)
         wait_for_policy_time = time.perf_counter() - send_start_time - send_batch_time
+        self.record_selection(batch, step)
         self.progress.step += 1
         self.update_dispatch_gate()
         if self.controller is not None:
@@ -730,6 +743,8 @@ class Orchestrator:
         source_metrics = self.train_source.metrics()
         metrics = await asyncio.to_thread(shipped_metrics)
         metrics = rollout_metrics | metrics | source_metrics
+        if batch.selection is not None:
+            metrics |= batch.selection.metrics()
         metrics["time/wait_for_policy"] = wait_for_policy_time
         await monitors.log(metrics, step=step)
 
@@ -759,6 +774,34 @@ class Orchestrator:
             await asyncio.shield(self.release_future)
         payload = (batch.samples, batch.cohort.episodes, effective_episodes, *micro_batch_grid)
         self.release_future = asyncio.get_running_loop().run_in_executor(None, release_and_trim, *payload)
+
+    async def ship(self, micro_batch_grid: list[list[MicroBatch]]) -> float:
+        """Send a batch, which waits until every trainer rank requested it. With batch selection, results keep
+        flowing into the sinks meanwhile, so inference works through the trainer's step and the pool fills for the
+        next batch; the train sink cuts no batch until this one has shipped. The sink's staleness sweep runs again
+        before the next batch is cut, at the step it trains on, so the off-policy bound holds."""
+        if self.config.batch_selection is None:
+            return await self.sender.send(micro_batch_grid)
+        send = asyncio.create_task(self.sender.send(micro_batch_grid), name="send_batch")
+        self.train_sink.shipping = True
+        try:
+            while not send.done():
+                try:
+                    item = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    self._raise_if_component_stopped()
+                    continue
+                await self.ingest(item)
+            return send.result()
+        finally:
+            self.train_sink.shipping = False
+            if not send.done():
+                await safe_cancel(send)
+
+    def record_selection(self, batch: TrainBatch, step: int, fate: Fate = "trained") -> None:
+        """Record the pooled groups a batch took as they leave the pool."""
+        if batch.selection is not None:
+            self.train_source.plans.record_selection(batch.selection.records(step, fate))
 
     async def start_draining(self, reason: str) -> None:
         """Stop scheduling train work and let the pipeline empty; triggered
@@ -825,9 +868,16 @@ class Orchestrator:
         multi_eval = self.eval_envs is not None and len(self.eval_envs) > 1
 
         # Train batch: finalized-group survivors only (0→target). Partial-group
-        # arrivals are surfaced as a separate ``(+N buffered)`` addendum
-        train_pct = train_batch / train_target if train_target else 0.0
-        train_batch_part = f"Train batch {train_batch}/{train_target} ({train_pct:.1%})"
+        # arrivals are surfaced as a separate ``(+N buffered)`` addendum. With
+        # batch selection, the survivors are the pool, filling to its cap.
+        pool = self.train_sink.pool
+        if pool is not None:
+            train_batch_part = (
+                f"Train pool {train_batch}/{pool.cap} ({train_batch / pool.cap:.1%}, batch {train_target})"
+            )
+        else:
+            train_pct = train_batch / train_target if train_target else 0.0
+            train_batch_part = f"Train batch {train_batch}/{train_target} ({train_pct:.1%})"
         if multi_train:
             pairs = [(e.name, train_batch_by_env.get(e.name, 0)) for e in self.train_envs]
             train_batch_part += " (" + ", ".join(f"{n}={v}" for n, v in pairs) + ")"

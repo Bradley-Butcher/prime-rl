@@ -486,6 +486,21 @@ class CurriculumPlansConfig(BaseConfig):
     stay stochastic."""
 
 
+class BatchSelectionConfig(BaseConfig):
+    """Train each step on the most informative admitted groups of an oversampled pool. Admitted groups queue in a
+    pool that keeps filling while the orchestrator waits for the trainer to take the last batch; a batch takes the
+    pool's highest-scored groups, ties going to the oldest (lowest dispatch policy version, then first admitted), and
+    leaves the rest for the next. A pooled group past ``max_off_policy_steps`` is dropped as any queued trace is, and
+    a group that takes the pool past its cap displaces the lowest-ranked."""
+
+    oversample: float = Field(1.5, ge=1.0)
+    """The pool's cap, in batches: ``ceil(oversample * batch_size)`` samples."""
+
+    score: Literal["variance"] = "variance"
+    """How informative a group is. ``variance``: the variance of its trainable rollouts' rewards, ``p(1-p)`` for
+    pass/fail rewards, largest when half of them pass."""
+
+
 class OrchestratorConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
     """The model being trained: its model fields plus the client of the live
@@ -543,6 +558,10 @@ class OrchestratorConfig(BaseConfig):
 
     constant_trainer_batch_size: bool = True
     """Require each batch to reach its effective sample target."""
+
+    batch_selection: BatchSelectionConfig | None = None
+    """Choose each batch's groups from an oversampled pool by how informative they are
+    (``[orchestrator.batch_selection]``). None trains on admitted groups in the order they finish."""
 
     concurrency: ConcurrencyConfig = ConcurrencyConfig()
     """Adaptive in-flight concurrency control (``[orchestrator.concurrency]``)."""
