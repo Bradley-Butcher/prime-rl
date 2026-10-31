@@ -574,6 +574,15 @@ def train(config: TrainerConfig):
                 micro_step_message += f" | Mismatch KL {tensors['mismatch_kl/all'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 
+            done, total = micro_step + 1, len(micro_batches)
+            if config.log.micro_step_interval and done % config.log.micro_step_interval == 0 and done < total:
+                elapsed = time.perf_counter() - forward_backward_start_time
+                left = elapsed / done * (total - done)
+                logger.info(
+                    f"Step {progress.step} | Micro batch {done}/{total} | {step_local_num_tokens} tokens | "
+                    f"{format_time(elapsed)} elapsed, ~{format_time(left)} left"
+                )
+
         annotation_writer.flush()
 
         # compute_loss already divided by the global token count. Undo FSDP's per-rank averaging

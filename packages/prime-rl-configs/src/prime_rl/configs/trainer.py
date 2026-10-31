@@ -567,6 +567,12 @@ class DataLoaderConfig(BaseConfig):
     """Number of background threads that prepare micro batches ahead of the training loop, analogous to torch DataLoader's ``num_workers`` but with threads instead of processes. 0 prepares them on the main thread."""
 
 
+class RLTrainerLogConfig(TrainerLogConfig):
+    micro_step_interval: int = Field(10, ge=0)
+    """Log the forward and backward pass's progress at INFO every this many micro batches of a step: how many are
+    done, this rank's tokens so far, the time elapsed and an estimate of the time left. 0 disables it."""
+
+
 class TrainerConfig(BaseConfig):
     model: ModelConfig = ModelConfig()
 
@@ -593,7 +599,7 @@ class TrainerConfig(BaseConfig):
     rollout_transport: TransportConfig = ZMQTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""
 
-    log: TrainerLogConfig = TrainerLogConfig()
+    log: RLTrainerLogConfig = RLTrainerLogConfig()
 
     monitors: MonitorsConfig = MonitorsConfig()
     """Metric monitors (``monitors.wandb``, ``monitors.file``)."""
