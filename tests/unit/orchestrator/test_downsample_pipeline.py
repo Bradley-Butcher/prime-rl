@@ -174,7 +174,7 @@ def test_each_admitted_group_ships_exactly_its_kept_eight(tmp_path, baseline):
     batches, by_task, arrivals = asyncio.run(run_pipeline(tmp_path, baseline))
 
     assert {task: record["admitted"] for task, record in by_task.items()} == {0: True, 1: True, 2: False, 3: True}
-    assert all(rollout["advantage"] is None for rollout in by_task[2]["rollouts"])
+    assert not any(rollout["kept"] or rollout["advantage"] is not None for rollout in by_task[2]["rollouts"])
     assert len(batches) == 3  # one TrainBatch of 8 per admitted group
 
     for batch in batches:

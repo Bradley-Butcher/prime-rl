@@ -57,9 +57,10 @@ def downsample_record(
     config: DownsampleConfig,
 ) -> dict[str, Any]:
     """A down-sampled group's line in ``curriculum/downsample.jsonl``: every rollout in the order it finished, with
-    its reward and turns, whether it was kept, and the advantage it trains with (None for a left-out rollout and for
-    every rollout of a group the gates rejected). ``failed`` counts the requests that returned no rollout."""
-    kept_ids = {trace.id for trace in kept}
+    its reward and turns, whether it was kept to train, and the advantage it trains with. A group that does not train
+    (the gates rejected it, or the pipeline dropped it, which the caller adds as ``cancelled``) keeps none.
+    ``failed`` counts the requests that returned no rollout."""
+    kept_ids = {trace.id for trace in kept} if admitted else set()
     rollouts = [
         {
             "trace": trace.id,
@@ -67,7 +68,7 @@ def downsample_record(
             "reward": trace.reward,
             "turns": trace.num_turns,
             "kept": trace.id in kept_ids,
-            "advantage": trained_advantage(trace) if admitted and trace.id in kept_ids else None,
+            "advantage": trained_advantage(trace) if trace.id in kept_ids else None,
         }
         for finish, episode in enumerate(group, start=1)
         for trace in episode.traces

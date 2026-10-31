@@ -26,7 +26,7 @@ from prime_rl.orchestrator.downsample import max_variance_subset
 from prime_rl.orchestrator.selection import reward_variance
 from prime_rl.orchestrator.train_sink import TrainSink
 from prime_rl.orchestrator.train_source import TrainSource
-from prime_rl.orchestrator.types import Policy, Progress, TaskRequest
+from prime_rl.orchestrator.types import GroupCancellation, Policy, Progress, TaskRequest
 from prime_rl.utils.logger import setup_logger
 
 setup_logger("warning")
@@ -213,8 +213,37 @@ def test_the_gate_looks_at_all_twelve(tmp_path):
     assert lines[tasks[1].key]["kept"]["successes"] == 1
     records = {line["key"]: line for line in map(json.loads, (tmp_path / "downsample.jsonl").read_text().splitlines())}
     assert records[tasks[0].key]["admitted"] is False
-    assert all(entry["advantage"] is None for entry in records[tasks[0].key]["rollouts"])
+    assert not any(entry["kept"] or entry["advantage"] is not None for entry in records[tasks[0].key]["rollouts"])
+    assert sum(entry["kept"] for entry in records[tasks[1].key]["rollouts"]) == M
     assert sink.take_kept_marks().keys() >= set(sink.pending_batch)
+
+
+@pytest.mark.parametrize("downsampled", [True, False])
+def test_an_overload_cut_voids_a_downsampled_group_and_leaves_the_rest_as_before(tmp_path, downsampled):
+    sink, source, tasks, env = downsampling_sink(tmp_path, "kept")
+    if not downsampled:
+        env.config.downsample, env.config.rollouts_per_task = None, M
+    dispatched = env.config.rollouts_per_task
+    # Six rollouts come back, mixed, before the concurrency controller cuts the rest of the group.
+    for reward in [1.0, 0.0] * 3:
+        asyncio.run(sink.add(rollout(tasks[0], reward, "cut")))
+    cut = GroupCancellation(
+        kind="train", env_name="env", group_id="cut", step=1, count=dispatched - 6, reason="overload"
+    )
+    asyncio.run(sink.cancel(cut))
+
+    window = sink.take_rollout_window(force=True)
+    groups = (tmp_path / "groups.jsonl").read_text().splitlines() if (tmp_path / "groups.jsonl").exists() else []
+    if downsampled:
+        # Its six fastest rollouts are not the twelve its eight are to be chosen from: none trains, the curriculum
+        # does not hear of it, and downsample.jsonl says why.
+        assert not sink.pending_batch and not groups and not source.curricula["env"].sampler.task_rewards
+        assert window.cancelled == N
+        (record,) = [json.loads(line) for line in (tmp_path / "downsample.jsonl").read_text().splitlines()]
+        assert (record["cancelled"], record["admitted"], len(record["rollouts"])) == ("overload", False, 6)
+        assert not any(entry["kept"] for entry in record["rollouts"])
+    else:
+        assert len(sink.pending_batch) == 6 and len(groups) == 1  # without down-sampling, as before
 
 
 def train(**group) -> dict:

@@ -245,10 +245,17 @@ class TrainSink:
         # A stale drop voids the whole group: every member shares the dispatch
         # version, so the arrived episodes are exactly as stale as the
         # cancelled tail. Stale and shutdown groups bypass the curriculum — a
-        # pipeline decision is not a task result.
-        if cancellation is not None and cancellation.reason in ("stale", "shutdown"):
+        # pipeline decision is not a task result. So does a down-sampled group
+        # an overload cut: what came back is its fastest rollouts, not the
+        # whole group its subset is to be chosen from.
+        downsampled = env.config.downsample is not None
+        voiding = ("stale", "shutdown", "overload") if downsampled else ("stale", "shutdown")
+        if cancellation is not None and cancellation.reason in voiding:
             self._record_group(group, failures, cancellation, env_name, admitted=False, cancelled=True)
             self._record_zero_output(group, [], n_owed)
+            if downsampled and group and self.on_downsample is not None:
+                record = downsample_record(group_id, group, failures, [], False, env.config.downsample)
+                self.on_downsample(record | {"cancelled": cancellation.reason})
             get_logger().debug(
                 f"Dropped group | env={env_name} task_idx={task_idx} | "
                 f"episodes={len(group)} traces={len(traces)} (errored={num_errored}) | "
