@@ -340,7 +340,10 @@ class Dispatcher:
         if now - self.admission_window_start >= self.admission_window_s:
             self.admission_window_start = now
             self.admissions_in_window = 0
-        min_burst = max((env.config.group_size for env in self.train_envs or ()), default=8)
+        min_burst = max(
+            (getattr(env.config, "rollouts_per_task", env.config.group_size) for env in self.train_envs or ()),
+            default=8,
+        )
         burst_cap = max(min_burst, self.max_inflight // 10)
         return burst_cap - self.admissions_in_window
 
@@ -553,7 +556,10 @@ class Dispatcher:
             return None
 
         env_name = request.env_name
-        rollouts = request.rollouts if request.rollouts is not None else envs.get(env_name).config.group_size
+        config = envs.get(env_name).config
+        # A down-sampled train source dispatches more rollouts than it trains on.
+        default_rollouts = config.rollouts_per_task if kind == "train" else config.group_size
+        rollouts = request.rollouts if request.rollouts is not None else default_rollouts
 
         return GroupState(
             kind=kind,

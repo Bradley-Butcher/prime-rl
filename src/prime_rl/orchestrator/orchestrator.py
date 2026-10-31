@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from transformers.tokenization_utils import PreTrainedTokenizer
 
     from prime_rl.orchestrator.ckpt import CheckpointManager
+    from prime_rl.transports.batch import MicroBatch
     from prime_rl.transports.batch.base import BatchSender
 import prime_rl._compat  # noqa: F401
 from prime_rl import monitors
@@ -47,7 +48,7 @@ from prime_rl.control.server import ControlServer
 from prime_rl.control.types import ConfigUpdate, InvalidConfigError, Reconfigurable
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.routing import is_trainable
-from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
+from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch, stamp_downsample
 from prime_rl.orchestrator.batch import BatchPacker
 from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
@@ -68,6 +69,7 @@ from prime_rl.orchestrator.train_source import TrainSource
 from prime_rl.orchestrator.trainer_capacity import TrainerCapacity
 from prime_rl.orchestrator.types import (
     DispatchFailure,
+    DispatchResult,
     EvalBatch,
     GroupCancellation,
     Policy,
@@ -389,6 +391,7 @@ class Orchestrator:
             on_result=self.train_source.on_result,
             on_groups_closed=self.train_source.close_groups,
             group_size=self.train_source.group_size,
+            on_downsample=self.train_source.plans.record_downsample,
         )
         self.concurrency = ConcurrencyController(config.concurrency, fallback_cost=config.seq_len)
         self.dispatcher = Dispatcher(
@@ -607,49 +610,56 @@ class Orchestrator:
                 self._raise_if_component_stopped()
                 continue
 
-            if isinstance(item, GroupCancellation):
-                assert item.kind == "train"  # eval groups are never dropped
-                train_batch = await self.train_sink.cancel(item)
-                await self.handle_train_result(train_batch)
-                continue
-            if isinstance(item, DispatchFailure):
-                if item.kind == "eval":
-                    assert self.eval_sink is not None
-                    eval_batch = self.eval_sink.fail(item)
-                    if eval_batch is not None:
-                        await self.finalize_eval_batch(eval_batch)
-                else:
-                    train_batch = await self.train_sink.fail(item)
-                    await self.handle_train_result(train_batch)
-                continue
-            episode = item
+            await self.ingest(item)
 
-            # Every completed rollout — errored, rejected, or never batched — lands in the
-            # ``all`` trace file the moment it arrives, so it survives crashes and drains.
-            # Train rollouts belong to the batch window currently collecting (``progress.step``),
-            # eval rollouts to the step whose eval triggered them.
-            if episode.run is None:
-                raise ValueError("Dispatched episode is missing run identity")
-            if not isinstance(episode.run, vf.TrainRunInfo):
-                raise ValueError("Orchestrated episode is missing training-run provenance")
-            kind = episode.run.work.type
-            step = episode.run.work.step if kind == "eval" else self.progress.step
-            stamp_arrival([episode], kind, step)
-            await monitors.log([episode], step, kind, "all")
-
-            if kind == "eval":
-                assert self.eval_sink is not None  # eval rollouts only emitted when eval is configured
-                eval_batch = self.eval_sink.add(episode)
+    async def ingest(self, item: DispatchResult) -> None:
+        """Route one terminal dispatcher result to the train or eval sink."""
+        if isinstance(item, GroupCancellation):
+            assert item.kind == "train"  # eval groups are never dropped
+            train_batch = await self.train_sink.cancel(item)
+            await self.handle_train_result(train_batch)
+            return
+        if isinstance(item, DispatchFailure):
+            if item.kind == "eval":
+                assert self.eval_sink is not None
+                eval_batch = self.eval_sink.fail(item)
                 if eval_batch is not None:
                     await self.finalize_eval_batch(eval_batch)
-                continue
+            else:
+                train_batch = await self.train_sink.fail(item)
+                await self.handle_train_result(train_batch)
+            return
+        episode = item
 
-            train_batch = await self.train_sink.add(episode)
-            await self.handle_train_result(train_batch)
+        # Every completed rollout — errored, rejected, or never batched — lands in the
+        # ``all`` trace file the moment it arrives, so it survives crashes and drains.
+        # Train rollouts belong to the batch window currently collecting (``progress.step``),
+        # eval rollouts to the step whose eval triggered them.
+        if episode.run is None:
+            raise ValueError("Dispatched episode is missing run identity")
+        if not isinstance(episode.run, vf.TrainRunInfo):
+            raise ValueError("Orchestrated episode is missing training-run provenance")
+        kind = episode.run.work.type
+        step = episode.run.work.step if kind == "eval" else self.progress.step
+        stamp_arrival([episode], kind, step)
+        await monitors.log([episode], step, kind, "all")
+
+        if kind == "eval":
+            assert self.eval_sink is not None  # eval rollouts only emitted when eval is configured
+            eval_batch = self.eval_sink.add(episode)
+            if eval_batch is not None:
+                await self.finalize_eval_batch(eval_batch)
+            return
+
+        train_batch = await self.train_sink.add(episode)
+        await self.handle_train_result(train_batch)
 
     async def handle_train_result(self, batch: TrainBatch | None) -> None:
         if self.heart is not None:
             self.heart.beat()
+        # Which rollouts of a down-sampled group train, beside their arrival records.
+        if kept_marks := self.train_sink.take_kept_marks():
+            await monitors.log_annotations(stamp_downsample(kept_marks))
         while batch is not None and not self.draining and not self.stopped.is_set():
             await self.finalize_train_batch(batch)
             if self.draining or self.stopped.is_set():
@@ -770,7 +780,7 @@ class Orchestrator:
         # the orchestrator spent waiting on the trainer for the next policy.
         send_start_time = time.perf_counter()
         self.unsent_rollouts = batch.cohort.num_traces
-        send_batch_time = await self.sender.send(micro_batch_grid)
+        send_batch_time = await self.ship(micro_batch_grid)
         self.unsent_rollouts = 0
         shipped_at = time.perf_counter()
         # The trainer's first step in a process includes its warmup, so its pace counts from the second one
@@ -863,6 +873,28 @@ class Orchestrator:
         payload = (batch.samples, batch.cohort.episodes, effective_episodes, *micro_batch_grid)
         self.release_future = asyncio.get_running_loop().run_in_executor(None, release_and_trim, *payload)
 
+    async def ship(self, micro_batch_grid: list[list[MicroBatch]]) -> float:
+        """Send a batch, which waits until every trainer rank requested it. With ``ingest_while_shipping``, results
+        keep flowing into the sinks meanwhile, so inference works through the trainer's step; the train sink cuts no
+        batch until this one has shipped. The sink's staleness sweep runs again before the next batch is cut, at the
+        step it trains on, so the staleness bound holds."""
+        if not self.config.ingest_while_shipping:
+            return await self.sender.send(micro_batch_grid)
+        send = asyncio.create_task(self.sender.send(micro_batch_grid), name="send_batch")
+        self.train_sink.shipping = True
+        try:
+            while not send.done():
+                try:
+                    item = await asyncio.wait_for(self.dispatcher.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    self._raise_if_component_stopped()
+                    continue
+                await self.ingest(item)
+            return send.result()
+        finally:
+            self.train_sink.shipping = False
+            if not send.done():
+                await safe_cancel(send)
     async def start_draining(self, reason: str) -> None:
         """Stop scheduling train work and let the pipeline empty; triggered
         eval epochs still run to completion."""

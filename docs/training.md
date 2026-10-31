@@ -111,6 +111,8 @@ A condensed view of the knobs you'll most often tune. For trainer-side paralleli
 | `orchestrator.batch_size` | Tasks per trainer step. |
 | `orchestrator.constant_trainer_batch_size` | Keep trainer batches constant when samples have no training signal, such as zero advantage on all tokens. Enabled by default. Disable it for faster collection with variable trainer batch sizes. |
 | `orchestrator.train.group_size` | Rollouts generated per task. |
+| `[orchestrator.train.downsample]` | Off by default. PODS rollout down-sampling ([arXiv:2504.13818](https://arxiv.org/abs/2504.13818)): each Task dispatches `rollouts` rollouts (n), waits for all of them, and trains on `group_size` (m) of them chosen by `rule = "max_variance"`, the subset whose rewards vary the most (pass/fail rewards with k passes keep `min(k, max(m/2, m - (n - k)))` passes). The admission gates, the difficulty sampler, `/v1/stats` and `groups.jsonl` see all n; `baseline = "kept"` (default, PODS) takes the advantages over the kept m, `"all"` over all n. Needs a `grpo`, `echo` or `max_rl` algorithm. Watch `downsample/reward/{all,kept}` and `rollout/traces/left_out`. |
+| `orchestrator.ingest_while_shipping` | Off by default. Keep taking finished rollouts while a batch waits for the trainer to request it, so inference keeps working through the trainer's step instead of stalling once the result queue fills; batches are still cut in arrival order, and `max_staleness` masks or drops what grows too stale. |
 | `orchestrator.max_staleness` | Maximum token staleness (default 8): the version a batch trains on minus the policy version that sampled the token, queue time included. Staler tokens are masked out of the loss; the rest of the sample still trains. Tokens without a policy label (Dynamo engines) take their rollout's dispatch version. A sample is dropped only when nothing is left to train, and rollouts are never cancelled for staleness. The main staleness dial on long agentic rollouts — bump for throughput, lower for tighter on-policyness. Watch `staleness/token/masked`, `staleness/rollout/*` and `mismatch_kl/all/mean` when tuning. |
 | `[orchestrator.train.algo]` | Training algorithm — its `type` names it (`grpo` default, `max_rl`, `rae`, `hierarchical_grpo`, `opd`, `opsd`, `sft`, `echo`). See [Algorithms](#algorithms). |
 | `trainer.model.freeze_moe_router` | Freeze MoE router gates (default `true` for RL, `false` for SFT). Router updates in RL shift the trainer's expert choices away from the ones inference sampled, amplifying the train-inference mismatch, so RL keeps the pretrained router. Set `false` to train it. |
@@ -189,12 +191,17 @@ Pulled from the console logs and mirrored to W&B.
 |---|---|---|
 | trainer | `time/wait_for_batch` | **high → orchestrator bottleneck** |
 | orchestrator | `time/wait_for_policy` | **high → trainer bottleneck** |
+<<<<<<< HEAD
 | orchestrator | `staleness/token/mean`, `staleness/token/masked` | mean token staleness of the shipped batch, and the share of its tokens masked past `max_staleness` |
 | orchestrator | `staleness/rollout/{mean,max}` | rollout staleness (max token staleness) of the shipped batch |
 | orchestrator | `staleness/rollout/{in_flight,in_queue}/{mean,max}` | in-flight and in-queue split of rollout staleness |
 | orchestrator | `staleness/rollout/dropped` | queued rollouts dropped because every token passed `max_staleness` |
 
 See [Async Training & Staleness](algorithms.md#async-training--staleness) for the token and rollout staleness definitions.
+=======
+| orchestrator | `downsample/reward/{all,kept}`, `rollout/traces/left_out` | with `downsample`: the mean reward of trained groups over every rollout and over the kept ones; the rollouts left out |
+| orchestrator | `selection/{pool,candidates,selected,carried,stale,displaced}`, `selection/score/{selected,passed}` | with `batch_selection`: groups in the pool when the batch was chosen, admitted since the last batch, taken, left for the next, dropped; mean score of the groups taken and passed over |
+>>>>>>> bc50c44fe (feat(orchestrator): PODS rollout down-sampling, and ingest_while_shipping without the selection pool)
 
 The trainer warns when batch wait time exceeds active trainer time. Add inference nodes when this warning persists. The orchestrator warns when policy wait time exceeds active orchestrator time. Add trainer nodes when this warning persists. The orchestrator also warns when it discards more than half of an episode window. This warning reports stale, errored, and no-signal counts.
 
@@ -660,7 +667,11 @@ curl 'localhost:8041/v1/stats?label=hard&label=hops:1'          # those labels' 
 
 `/v1/stats` lists each Task with its labels, and aggregates groups, mixed-outcome share and mean reward per label across envs: for the labels named with `label=`, else the `top_labels` (default 20) with the most groups.
 
+<<<<<<< HEAD
 The orchestrator records its curriculum under `<output_dir>/curriculum/`, with or without the API: `plans.jsonl` holds every plan posted or deleted with its time, author and note; `dispatch.jsonl` holds every dispatched Task with its step and what chose it (its plan's id, or `null` for the configured sampler), plus a summary line per step; `groups.jsonl` holds every finalized group's outcome, which the stats are built from. A resume reads them back up to its step.
+=======
+The orchestrator records its curriculum under `<output_dir>/curriculum/`, with or without the API: `plans.jsonl` holds every plan posted or deleted with its time, author and note; `dispatch.jsonl` holds every dispatched Task with its step and what chose it (its plan's id, or `null` for the configured sampler), plus a summary line per step; `groups.jsonl` holds every finalized group's outcome, which the stats are built from. A resume reads them back up to its step. A down-sampled group's outcome is over every rollout it dispatched, with the rollouts it trains on (how many, their mean reward, their passes) under `kept`; `downsample.jsonl` lists each of its rollouts in the order they finished, with its reward, turns, whether it was kept and the advantage it trains with, and the trace stream marks each `downsample.kept`. With `[orchestrator.batch_selection]`, `selection.jsonl` holds how each admitted group left the pool: `trained` at a step, or `stale`, `displaced` or `discarded`, with its score and how many batches passed it over. A plan's shares set what is dispatched, and selection then picks from it, so the trained batch leans toward the sources whose groups are more often mixed, and nearer half passing: `/v1/stats` counts every finalized group, trained or not.
+>>>>>>> bc50c44fe (feat(orchestrator): PODS rollout down-sampling, and ingest_while_shipping without the selection pool)
 
 To rerun a recorded run's Task schedule, set `--orchestrator.curriculum-plans.replay-from` to another run's `curriculum/dispatch.jsonl`: each step dispatches the Tasks the record lists for it, in order, then samples, and steps the record lacks sample as configured. A replaying run refuses plans. Replay repeats the schedule, not the outcomes: sampling, the envs and their worlds stay stochastic, and a step that dispatches more groups than its recorded step samples the rest.
 

@@ -96,18 +96,23 @@ def source_name(source: dict) -> str:
 
 
 def run_sources(config: dict) -> list[dict]:
-    """Each training source's name, config share, group size, default shaping and difficulty pools."""
+    """Each training source's name, config share, group size, rollouts per Task, default shaping and difficulty
+    pools."""
     train = config.get("train") or {}
     sources = train.get("source") or []
     total = sum(source.get("ratio") or 1.0 for source in sources) or 1.0
     out = []
     for source in sources:
         sampler = (source.get("curriculum") or {}).get("sampler") or {}
+        group_size = source.get("group_size") or train.get("group_size") or 1
+        downsample = source.get("downsample") or train.get("downsample") or {}
         out.append(
             {
                 "name": source_name(source),
                 "share": (source.get("ratio") or 1.0) / total,
-                "group_size": source.get("group_size") or train.get("group_size") or 1,
+                "group_size": group_size,
+                # Rollouts a group dispatches, more than it trains on when down-sampled.
+                "rollouts": downsample.get("rollouts") or group_size,
                 "shaping": ((source.get("algo") or {}).get("shaping")),
                 "pools": {name: pool.get("weight") for name, pool in (sampler.get("pools") or {}).items()}
                 if sampler.get("type") == "difficulty_pool"
@@ -425,7 +430,7 @@ def view(run_dir: Path, config: dict, control_url: str | None = None) -> dict:
         sampled, count = sum(t[0] for t in tokens if t), sum(t[1] for t in tokens if t)
         if not count or rate["signal"] is None:
             return None
-        group_tokens = sampled / count * sources[0]["group_size"]
+        group_tokens = sampled / count * sources[0]["rollouts"]
         return rate["signal"] / (group_tokens / 1e6) if group_tokens else None
 
     now_event, now_shares = planned(dispatching)

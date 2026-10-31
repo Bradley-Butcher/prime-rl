@@ -69,7 +69,8 @@ class TrainSource(Reconfigurable):
             env_name, task, group_size = self.reopened.popleft()
         else:
             env_name, task = self.plans.draw(step) if self.plans is not None else self.draw()
-            group_size = self.envs_by_name[env_name].config.group_size
+            config = self.envs_by_name[env_name].config
+            group_size = getattr(config, "rollouts_per_task", config.group_size)
         group_id = str(uuid.uuid4())
         self.open_groups[group_id] = (env_name, task.key, group_size)
         return TaskRequest(env_name=env_name, task=task, step=step, rollouts=group_size, group_id=group_id)
@@ -89,8 +90,9 @@ class TrainSource(Reconfigurable):
         for group_id in group_ids:
             self.open_groups.pop(group_id, None)
 
-    def on_result(self, group: list[vf.Episode]) -> bool:
-        """Report a finalized group and return whether it should train."""
+    def on_result(self, group: list[vf.Episode], kept_trace_ids: set[str] | None = None) -> bool:
+        """Report a finalized group and return whether it should train. A down-sampled group reports every rollout,
+        with ``kept_trace_ids`` the ones it trains on if admitted."""
         if not group:
             raise ValueError("Cannot report an empty rollout group")
         env_name = episode_env_name(group[0])
@@ -98,7 +100,10 @@ class TrainSource(Reconfigurable):
         if not isinstance(admitted, bool):
             raise TypeError(f"Curriculum.on_result() must return bool, got {type(admitted).__name__}")
         if self.plans is not None:
-            self.plans.observe(group)
+            if kept_trace_ids is None:
+                self.plans.observe(group)
+            else:
+                self.plans.observe(group, kept=kept_trace_ids if admitted else set())
         if admitted:
             self._admitted[env_name] += 1
         else:

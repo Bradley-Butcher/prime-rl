@@ -97,7 +97,7 @@ def sink(*, constant=True, admitted=True, batch_size=100, closed=None, group_siz
     group_size_fn = group_size if callable(group_size) else None
     config = OrchestratorConfig(batch_size=batch_size, constant_trainer_batch_size=constant, max_staleness=1)
     env = SimpleNamespace(
-        config=SimpleNamespace(group_size=env_group_size),
+        config=SimpleNamespace(group_size=env_group_size, rollouts_per_task=env_group_size, downsample=None),
         sampling_at=lambda step: vf.SamplingConfig(temperature=1.0),
         requires_sampling_masks=False,
         requires_sampler_logprobs=False,

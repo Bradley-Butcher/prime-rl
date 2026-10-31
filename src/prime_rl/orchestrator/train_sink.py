@@ -5,11 +5,14 @@ episode, and ``cancel()`` a dropped group's ``GroupCancellation``. Before every
 readiness check the sink sweeps ``pending_batch`` for traces past
 ``max_staleness`` — this sweep is what guarantees no stale token trains. Completed groups become numeric
 observations; only queued traces retain verifier objects. The consumer drains
-``take_rollout_window(force=True)`` before shipping a batch."""
+``take_rollout_window(force=True)`` before shipping a batch. With a source's
+``downsample``, a group trains on the rollouts ``prime_rl.orchestrator.downsample``
+keeps."""
 
 from __future__ import annotations
 
 import asyncio
+import random
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 
@@ -20,6 +23,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.control.types import ConfigUpdate, Reconfigurable
 from prime_rl.orchestrator.algo.base import iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import stamp_loss_routing
+from prime_rl.orchestrator.downsample import downsample_record, max_variance_subset
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.metrics import RolloutWindow, TrainEpisodes
 from prime_rl.orchestrator.trajectories import iter_trainable_branches, trace_to_samples
@@ -133,9 +137,10 @@ class TrainSink(Reconfigurable):
         train_envs: TrainEnvs,
         progress: Progress,
         batch_size: int,
-        on_result: Callable[[list[vf.Episode]], bool] | None = None,
+        on_result: Callable[..., bool] | None = None,
         on_groups_closed: Callable[[Iterable[str]], None] | None = None,
         group_size: Callable[[str], int | None] | None = None,
+        on_downsample: Callable[[dict], None] | None = None,
     ) -> None:
         """``on_groups_closed`` receives the ids of every group that closes: a group
         that finalized without anything to ship, or one whose batch shipped (`shipped`).
@@ -149,6 +154,14 @@ class TrainSink(Reconfigurable):
         self.on_result = on_result
         self.on_groups_closed = on_groups_closed
         self.group_size = group_size
+        # Records every rollout of a down-sampled group: whether it was kept and the advantage it trains with.
+        self.on_downsample = on_downsample
+        # Set while the consumer ships a batch: groups keep queueing, but no
+        # batch is cut until that one has shipped.
+        self.shipping = False
+        self.downsample_rngs: dict[str, random.Random] = {}
+        # Trained down-sampled groups' rollouts by whether they were kept, for the trace stream.
+        self.kept_marks: dict[str, bool] = {}
 
         self.rollout_window = RolloutWindow()
         self.pending_groups: dict[str, list[vf.Episode]] = defaultdict(list)
@@ -182,8 +195,12 @@ class TrainSink(Reconfigurable):
         self._release(sample_payload_urls(samples))
 
     def group_size_for(self, group_id: str, env_name: str) -> int:
+        """Rollouts a group finalizes after: every one dispatched, down-sampled or not."""
         size = self.group_size(group_id) if self.group_size is not None else None
-        return size if size is not None else self.train_envs.get(env_name).config.group_size
+        if size is not None:
+            return size
+        config = self.train_envs.get(env_name).config
+        return getattr(config, "rollouts_per_task", config.group_size)
 
     def batch_progress(self) -> tuple[int, int]:
         return len(self.pending_batch), self.batch_size
@@ -247,6 +264,8 @@ class TrainSink(Reconfigurable):
         """Sweep stale queued traces, then cut a batch if the survivors still
         meet the threshold."""
         self._drop_stale()
+        if self.shipping:
+            return None
         return await self.process_batch() if len(self.pending_batch) >= self.batch_size else None
 
     def _drop_stale(self, trace_ids: Iterable[str] | None = None) -> None:
@@ -350,7 +369,19 @@ class TrainSink(Reconfigurable):
         survivors = [trace for _, trace in iter_trainable_traces(group, env.algorithm.drop_truncated)]
         if survivors:
             await env.algorithm.score_group(group)
-        admitted = self._admit(group) if group else False
+        # Down-sampling picks the rollouts that train before admission, so the gates, the
+        # difficulty sampler and the curriculum records see the whole group with its pick.
+        kept = self._downsample(env_name, env, survivors)
+        admitted = self._admit(group, kept) if group else False
+        left_out: set[str] = set()
+        if kept is not None and survivors and admitted:
+            self._observe_downsample(survivors, kept)
+            left_out = {trace.id for trace in survivors} - {trace.id for trace in kept}
+            if left_out:
+                await self._score_kept(env, group, kept)
+            survivors = kept
+        if kept is not None and group and self.on_downsample is not None:
+            self.on_downsample(downsample_record(group_id, group, failures, kept, admitted, env.config.downsample))
         if not survivors or not admitted:
             self._close([group_id])
             self._record_group(group, failures, cancellation, env_name, admitted=admitted)
@@ -390,7 +421,7 @@ class TrainSink(Reconfigurable):
 
         if not samples_by_trace:
             self._close([group_id])
-            self._record_group(group, failures, cancellation, env_name)
+            self._record_group(group, failures, cancellation, env_name, left_out_trace_ids=left_out)
             self._record_zero_output(group, survivors, n_owed, reason="zero advantage")
             return
 
@@ -407,7 +438,15 @@ class TrainSink(Reconfigurable):
             if any(trace.id in samples_by_trace for trace in episode.traces)
             and not any(trace.id in queued for trace in episode.traces)
         ]
-        self._record_group(group, failures, cancellation, env_name, queued_trace_ids=queued, cancelled=stale)
+        self._record_group(
+            group,
+            failures,
+            cancellation,
+            env_name,
+            queued_trace_ids=queued,
+            left_out_trace_ids=left_out,
+            cancelled=stale,
+        )
         # A fully-voided group shipped nothing — advance the zero-output tally
         # instead of resetting it, or a stalled trainer plus a tight bound
         # could void groups forever without ever surfacing the warning.
@@ -427,11 +466,17 @@ class TrainSink(Reconfigurable):
         admitted: bool = True,
         cancelled: Iterable[vf.Episode] = (),
         queued_trace_ids: set[str] | None = None,
+        left_out_trace_ids: set[str] | None = None,
     ) -> None:
         episodes = TrainEpisodes(cancelled={episode.id for episode in cancelled})
         episodes.extend(group, admitted=admitted)
         self.rollout_window.observe(
-            episodes, failures, cancellation, env_name=env_name, queued_trace_ids=queued_trace_ids or set()
+            episodes,
+            failures,
+            cancellation,
+            env_name=env_name,
+            queued_trace_ids=queued_trace_ids or set(),
+            left_out_trace_ids=left_out_trace_ids or set(),
         )
 
     def take_rollout_window(self, *, force: bool = False) -> RolloutWindow | None:
@@ -472,8 +517,55 @@ class TrainSink(Reconfigurable):
             queued = {episode_group_id(episode) for episode in self.episode_by_trace.values()}
             self._close(group_ids - queued)
 
-    def _admit(self, group: list[vf.Episode]) -> bool:
-        return self.on_result(group) if self.on_result is not None else True
+    def _admit(self, group: list[vf.Episode], kept: list[vf.Trace] | None = None) -> bool:
+        if self.on_result is None:
+            return True
+        if kept is None:
+            return self.on_result(group)
+        return self.on_result(group, kept_trace_ids={trace.id for trace in kept})
+
+    def _downsample(self, env_name: str, env, survivors: list[vf.Trace]) -> list[vf.Trace] | None:
+        """The rollouts of a down-sampled group that train, by ``downsample.rule``; None without down-sampling."""
+        config = getattr(env.config, "downsample", None)
+        if config is None:
+            return None
+        if env_name not in self.downsample_rngs:
+            self.downsample_rngs[env_name] = random.Random(config.seed)
+        rewards = [trace.reward for trace in survivors]
+        kept = max_variance_subset(rewards, env.config.group_size, self.downsample_rngs[env_name])
+        return [survivors[index] for index in kept]
+
+    async def _score_kept(self, env, group: list[vf.Episode], kept: list[vf.Trace]) -> None:
+        """Score the kept rollouts as a group of their own, for their advantages over their own mean
+        (``baseline = "kept"``) and their loss weights; ``baseline = "all"`` restores the advantages scored over the
+        whole group."""
+        kept_ids = {trace.id for trace in kept}
+        kept_group = [
+            episode.model_copy(update={"traces": [trace for trace in episode.traces if trace.id in kept_ids]})
+            for episode in group
+            if any(trace.id in kept_ids for trace in episode.traces)
+        ]
+        whole_group = {trace.id: [node.advantages for node in trace.nodes] for trace in kept}
+        await env.algorithm.score_group(kept_group)
+        if env.config.downsample.baseline == "all":
+            for trace in kept:
+                for node, advantages in zip(trace.nodes, whole_group[trace.id], strict=True):
+                    node.advantages = advantages
+
+    def _observe_downsample(self, survivors: list[vf.Trace], kept: list[vf.Trace]) -> None:
+        """Count an admitted group's rewards over every rollout and over the kept ones, and mark which rollouts were
+        kept for the trace stream."""
+        kept_ids = {trace.id for trace in kept}
+        metrics = self.rollout_window.metrics
+        metrics.rate("downsample/reward/all", {"": sum(trace.reward for trace in survivors)}, len(survivors))
+        metrics.rate("downsample/reward/kept", {"": sum(trace.reward for trace in kept)}, len(kept))
+        if len(kept) < len(survivors):
+            self.kept_marks |= {trace.id: trace.id in kept_ids for trace in survivors}
+
+    def take_kept_marks(self) -> dict[str, bool]:
+        """Rollouts of trained down-sampled groups by whether they were kept, since the last call."""
+        marks, self.kept_marks = self.kept_marks, {}
+        return marks
 
     def _record_zero_output(
         self, group: list[vf.Episode], survivors: list[vf.Trace], n_owed: int, *, reason: str

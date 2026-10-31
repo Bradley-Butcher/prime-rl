@@ -122,7 +122,7 @@ def test_the_zero_advantage_gate_sees_the_shaped_rewards(shaping):
         tokenizer=None,
         train_envs=SimpleNamespace(
             get=lambda name: SimpleNamespace(
-                config=SimpleNamespace(group_size=2),
+                config=SimpleNamespace(group_size=2, rollouts_per_task=2, downsample=None),
                 sampling_at=lambda step: vf.SamplingConfig(temperature=1.0),
                 requires_sampling_masks=False,
                 requires_sampler_logprobs=False,
