@@ -122,6 +122,7 @@ A condensed view of the knobs you'll most often tune. For trainer-side paralleli
 | Knob | What it does |
 |---|---|
 | `log.level` | Process log level for trainer + orchestrator (`info` default; falls back to `$PRIME_LOG_LEVEL`). Set per-process via `trainer.log.level` / `orchestrator.log.level`, or globally on the `rl` entrypoint to propagate to both. The orchestrator's env servers and its [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) logs use the same level. |
+| `trainer.log.micro_step_interval` | Log a step's forward/backward progress every this many micro batches (default 10; 0 disables): micro batches done, tokens so far, time elapsed and an estimate of the time left. |
 | `--monitors.wandb` (+ `--monitors.wandb.project`, `--monitors.wandb.name`) | Enable Weights & Biases logging. See [Weights & Biases](#weights--biases). |
 | `--monitors.prime` | Stream metrics and episodes to the Prime Intellect platform (Prime Lab), off by default. See [Prime](#prime). |
 

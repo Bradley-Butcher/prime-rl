@@ -400,6 +400,7 @@ def train(config: TrainerConfig):
         routing_stats = []
         step_local_num_tokens = 0
         step_local_flops = 0
+        fb_start_time = time.perf_counter()
         score_centering = config.loss.type == "icepop" and config.loss.score_centering
         score_centering_errors = []
         for micro_step, micro_batch in enumerate(micro_batch_workers(prepare, micro_batches)):
@@ -644,6 +645,15 @@ def train(config: TrainerConfig):
                 lambda: out["entropy"][loss_mask].mean().item(),
                 lambda: mismatch_kl[mismatch_mask].mean().item(),
             )
+
+            done, total = micro_step + 1, len(micro_batches)
+            if annotate and config.log.micro_step_interval and done % config.log.micro_step_interval == 0 and done < total:
+                elapsed = time.perf_counter() - fb_start_time
+                left = elapsed / done * (total - done)
+                logger.info(
+                    f"Step {progress.step} | Micro batch {done}/{total} | {step_local_num_tokens} tokens | "
+                    f"{format_time(elapsed)} elapsed, ~{format_time(left)} left"
+                )
 
         if annotate and annotation_writer is not None:
             annotation_writer.flush()

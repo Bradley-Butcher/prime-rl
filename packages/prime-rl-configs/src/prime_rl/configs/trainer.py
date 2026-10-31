@@ -702,6 +702,12 @@ class DataLoaderConfig(BaseConfig):
     """Number of background threads that prepare micro batches ahead of the training loop, analogous to torch DataLoader's ``num_workers`` but with threads instead of processes. 0 prepares them on the main thread."""
 
 
+class RLTrainerLogConfig(TrainerLogConfig):
+    micro_step_interval: int = Field(10, ge=0)
+    """Log the forward and backward pass's progress at INFO every this many micro batches of a step: how many are
+    done, this rank's tokens so far, the time elapsed and an estimate of the time left. 0 disables it."""
+
+
 class BaseTrainerConfig(BaseConfig):
     """Fields and validators shared by the RL trainer (``TrainerConfig``) and the SFT and pretraining trainer
     (``SupervisedTrainerConfig``)."""
@@ -815,6 +821,8 @@ class TrainerConfig(BaseTrainerConfig):
     auto_weight_decay = 0.0
 
     data: DataLoaderConfig = DataLoaderConfig()
+
+    log: RLTrainerLogConfig = RLTrainerLogConfig()
 
     loss: LossConfig = IPOLossConfig()
     """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
