@@ -355,10 +355,19 @@ class TrainSink(Reconfigurable):
         n_owed = len(group) + len(failures) + (cancellation.count if cancellation is not None else 0)
         # A shutdown drop voids the whole group and bypasses the curriculum —
         # a pipeline decision is not a task result. The group stays open, so a
-        # resume re-runs it.
-        if cancellation is not None and cancellation.reason == "shutdown":
+        # resume re-runs it. So does a down-sampled group an overload cut: what
+        # came back is its fastest rollouts, not the whole group its subset is
+        # to be chosen from.
+        downsampled = getattr(env.config, "downsample", None) is not None
+        voiding = ("shutdown", "overload") if downsampled else ("shutdown",)
+        if cancellation is not None and cancellation.reason in voiding:
+            if cancellation.reason != "shutdown":
+                self._close([group_id])
             self._record_group(group, failures, cancellation, env_name, admitted=False, cancelled=group)
             self._record_zero_output(group, [], n_owed, reason="cancelled")
+            if downsampled and group and self.on_downsample is not None:
+                record = downsample_record(group_id, group, failures, [], False, env.config.downsample)
+                self.on_downsample(record | {"cancelled": cancellation.reason})
             get_logger().debug(
                 f"Dropped group | env={env_name} task_idx={task_idx} | "
                 f"episodes={len(group)} traces={len(traces)} (errored={num_errored}) | "
