@@ -222,6 +222,31 @@ class CurriculumConfig(BaseConfig):
     and a group trains only when every gate admits it."""
 
 
+DOWNSAMPLED_ALGOS = ("grpo", "echo", "max_rl")
+"""Algorithms whose advantages come from a group's rewards alone, so a group can be scored again on its kept subset."""
+
+
+class DownsampleConfig(BaseConfig):
+    """PODS rollout down-sampling (arXiv:2504.13818, section 3): dispatch ``rollouts`` rollouts per Task, wait for all
+    of them, and train on ``group_size`` of them. The admission gates, the difficulty sampler and the curriculum
+    records see every rollout; the left-out rollouts are not trained."""
+
+    rollouts: int = Field(ge=2)
+    """Rollouts dispatched per Task (PODS's n), at least ``group_size`` (its m)."""
+
+    rule: Literal["max_variance"] = "max_variance"
+    """Which rollouts train. ``max_variance``: the subset whose rewards vary the most. With pass/fail rewards and
+    ``k`` passes it keeps ``s = min(k, max(m // 2, m - (n - k)))`` passes and ``m - s`` failures; other rewards keep
+    the top ``i`` and bottom ``m - i`` rewards for the ``i`` that maximises the variance, ties at random. Rollouts
+    with equal rewards are chosen uniformly at random."""
+
+    baseline: Literal["kept", "all"] = "kept"
+    """The advantage baseline. ``kept`` (PODS): reward minus the kept rollouts' mean. ``all`` (Reinforce-Ada,
+    arXiv:2510.04996): reward minus the mean of every rollout of the group, applied to the kept ones."""
+
+    seed: int = 42
+
+
 class TrainSourceConfig(EnvConfig):
     sampling: TrainSamplingConfig = TrainSamplingConfig()
     """Per-env sampling overrides. Unset fields inherit from the group-level train sampling config."""
@@ -242,6 +267,31 @@ class TrainSourceConfig(EnvConfig):
     curriculum: CurriculumConfig | None = None
     """User-authored task sampler and admission gates. The default cycles
     through the taskset and admits every finalized group."""
+
+    downsample: DownsampleConfig | None = None
+    """Dispatch more rollouts per Task than ``group_size`` and train on ``group_size`` of them (PODS). None trains on
+    every rollout of a ``group_size`` group."""
+
+    @property
+    def rollouts_per_task(self) -> int:
+        """Rollouts dispatched per Task: ``downsample.rollouts``, else ``group_size``."""
+        return self.downsample.rollouts if self.downsample is not None else self.group_size
+
+    @model_validator(mode="after")
+    def validate_downsample(self):
+        if self.downsample is None:
+            return self
+        if self.downsample.rollouts < self.group_size:
+            raise ValueError(
+                f"Source '{self.resolved_name}' dispatches downsample.rollouts = {self.downsample.rollouts}, fewer "
+                f"than the group_size = {self.group_size} it trains on"
+            )
+        if self.algo.type not in DOWNSAMPLED_ALGOS:
+            raise ValueError(
+                f"Source '{self.resolved_name}': down-sampling needs advantages from a group's rewards alone "
+                f"({', '.join(DOWNSAMPLED_ALGOS)}), not {self.algo.type!r}"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_policy_sampling(self):
@@ -350,6 +400,9 @@ class TrainConfig(SourceGroupConfig):
 
     algo: AlgoConfig = GRPOAlgoConfig()
     """Training algorithm that every training source inherits. Defaults to ``grpo``."""
+
+    downsample: DownsampleConfig | None = None
+    """Rollout down-sampling that every training source inherits (``[orchestrator.train.downsample]``)."""
 
     @model_validator(mode="after")
     def validate_unique_env_names(self):
@@ -561,7 +614,14 @@ class OrchestratorConfig(BaseConfig):
 
     batch_selection: BatchSelectionConfig | None = None
     """Choose each batch's groups from an oversampled pool by how informative they are
-    (``[orchestrator.batch_selection]``). None trains on admitted groups in the order they finish."""
+    (``[orchestrator.batch_selection]``). None trains on admitted groups in the order they finish. Implies
+    ``ingest_while_shipping``."""
+
+    ingest_while_shipping: bool = False
+    """Keep taking finished rollouts while a cut batch waits for the trainer to request it, so inference keeps
+    working through the trainer's step instead of stalling once the result queue fills. The next batch is cut, in
+    arrival order, once this one has shipped; ``max_off_policy_steps`` still drops queued rollouts that grow too
+    stale."""
 
     concurrency: ConcurrencyConfig = ConcurrencyConfig()
     """Adaptive in-flight concurrency control (``[orchestrator.concurrency]``)."""
@@ -725,13 +785,17 @@ class OrchestratorConfig(BaseConfig):
                 f"Batch size {self.batch_size} must be divisible by every train source's group_size {sorted(set(group_sizes))}"
             )
 
+        dispatched = max([source.rollouts_per_task for source in self.train.source] or group_sizes)
         for field in ("max_inflight", "initial_inflight"):
             value = getattr(self.concurrency, field)
-            if value is not None and value < max(group_sizes):
+            if value is not None and value < dispatched:
                 raise ValueError(
-                    f"concurrency.{field} must be at least the largest train group_size ({max(group_sizes)})"
+                    f"concurrency.{field} must be at least the most rollouts a train source dispatches per Task "
+                    f"({dispatched})"
                 )
 
+        if self.batch_selection is not None:
+            self.ingest_while_shipping = True
         return self
 
     @model_validator(mode="after")

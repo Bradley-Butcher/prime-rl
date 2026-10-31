@@ -94,7 +94,12 @@ def sink(*, constant=True, admitted=True, batch_size=100, group_size=1, algorith
         batch_selection=selection,
     )
     env = SimpleNamespace(
-        config=SimpleNamespace(group_size=group_size, sampling=SimpleNamespace(temperature=1.0)),
+        config=SimpleNamespace(
+            group_size=group_size,
+            rollouts_per_task=group_size,
+            downsample=None,
+            sampling=SimpleNamespace(temperature=1.0),
+        ),
         requires_sampling_masks=False,
         algorithm=algorithm or Algorithm(GRPOAlgoConfig(), None),
     )

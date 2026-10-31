@@ -9,10 +9,13 @@ JSONL files in one directory keep the run repeatable:
 - ``dispatch.jsonl``: every Task dispatched, with its step and what chose it, and a summary line per step.
   Another run replays the schedule from it.
 - ``groups.jsonl``: every finalized group's outcome, which the stats are built from, with the reward shaping it
-  trained under (``prime_rl.orchestrator.curriculum.shaping``, whose changes ``shaping.jsonl`` records).
+  trained under (``prime_rl.orchestrator.curriculum.shaping``, whose changes ``shaping.jsonl`` records). A
+  down-sampled group's outcome is over every rollout, with the rollouts it trains on under ``kept``.
 
 With ``batch_selection``, ``selection.jsonl`` holds how each admitted group left the selection pool: trained at a
-step, or dropped (``prime_rl.orchestrator.selection``). Its ``step`` is the step it left at.
+step, or dropped (``prime_rl.orchestrator.selection``). Its ``step`` is the step it left at. With a down-sampled
+source, ``downsample.jsonl`` lists every rollout of each group, kept or left out, with the advantage it trains with
+(``prime_rl.orchestrator.downsample``); its ``step`` is the dispatch step, as in ``groups.jsonl``.
 
 A resume reads them back, keeping the dispatch and group records up to its step.
 """
@@ -161,6 +164,17 @@ def group_outcome(group: list[vf.Episode]) -> dict[str, Any]:
     }
 
 
+def kept_outcome(group: list[vf.Episode], kept: set[str]) -> dict[str, Any]:
+    """The rollouts a down-sampled group trains on, for its ``groups.jsonl`` line: how many, their mean reward and
+    how many of them passed. The line's own numbers are over every rollout of the group."""
+    rewards = [trace.reward for episode in group for trace in episode.traces if trace.id in kept]
+    return {
+        "rollouts": len(rewards),
+        "reward": sum(rewards) / len(rewards) if rewards else None,
+        "successes": sum(reward == 1.0 for reward in rewards),
+    }
+
+
 LABEL_STATS = ("groups", "mixed_share", "mean_reward")
 """What ``/v1/stats`` gives per label, of an env's stats."""
 
@@ -296,14 +310,16 @@ class Plans:
         self.dispatch_path = directory / "dispatch.jsonl"
         self.groups_path = directory / "groups.jsonl"
         self.selection_path = directory / "selection.jsonl"
+        self.downsample_path = directory / "downsample.jsonl"
         self._read_plans(fresh=resume_step is None)
         for record in _keep_records(self.dispatch_path, self.dispatch_step):
             if record["type"] == "task" and record["origin"] is not None:
                 self.used[record["step"]] = record["origin"]
         for outcome in _keep_records(self.groups_path, self.dispatch_step):
             self._tally(outcome)
-        if self.selection_path.exists():
-            _keep_records(self.selection_path, self.dispatch_step)
+        for path in (self.selection_path, self.downsample_path):
+            if path.exists():
+                _keep_records(path, self.dispatch_step)
 
     # ── the API's side ─────────────────────────────────────────────────────
 
@@ -472,9 +488,12 @@ class Plans:
                 get_logger().info(f"Step {step} dispatched its {active.cursor} planned Tasks; it samples from here")
             return env_name, task
 
-    def observe(self, group: list[vf.Episode]) -> None:
-        """Count a finalized group in the stats of the run and of the step it was dispatched at."""
+    def observe(self, group: list[vf.Episode], kept: set[str] | None = None) -> None:
+        """Count a finalized group in the stats of the run and of the step it was dispatched at. A down-sampled
+        group's line also records the rollouts it trains on, ``kept`` (empty for a group that does not train)."""
         outcome = group_outcome(group)
+        if kept is not None:
+            outcome["kept"] = kept_outcome(group, kept) if kept else None
         if self.shaping is not None:
             outcome |= self.shaping.record(group)
         with self.lock:
@@ -486,6 +505,11 @@ class Plans:
         with self.lock:
             for record in records:
                 _append(self.selection_path, record)
+
+    def record_downsample(self, record: dict[str, Any]) -> None:
+        """Append a down-sampled group's rollouts (``prime_rl.orchestrator.downsample.downsample_record``)."""
+        with self.lock:
+            _append(self.downsample_path, record)
 
     def close(self) -> None:
         """Summarize the step dispatching now, as the next step's dispatch would."""

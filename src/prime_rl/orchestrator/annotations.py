@@ -30,6 +30,12 @@ def stamp_arrival(episodes: list[vf.Episode], kind: Kind, step: int) -> None:
             trace.info["arrival"] = {"step": step, "time": now}
 
 
+def stamp_downsample(kept: dict[str, bool]) -> list[dict[str, Any]]:
+    """The updates marking which rollouts of a down-sampled group it trains on: a left-out rollout is never
+    trained, a kept one when its batch ships (``stamp_batch``)."""
+    return [make_update(trace_id, info={"downsample": {"kept": is_kept}}) for trace_id, is_kept in kept.items()]
+
+
 def stamp_batch(episodes: list[vf.Episode], step: int) -> list[dict[str, Any]]:
     """The updates a batched cohort adds over its arrival records: membership, the step
     it ties to, the scalar advantage, and the per-token advantage streams."""

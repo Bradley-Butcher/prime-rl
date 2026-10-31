@@ -179,7 +179,7 @@ class Dispatcher:
         self.admission_window_s = 5.0
         self.admission_window_start = time.monotonic()
         self.admissions_in_window = 0
-        self.min_burst = max((env.config.group_size for env in train_envs or ()), default=8)
+        self.min_burst = max((env.config.rollouts_per_task for env in train_envs or ()), default=8)
 
         self.inflight: dict[asyncio.Task, InflightEpisode] = {}
         self.live_events: list[dict[str, Any]] = []
@@ -525,7 +525,10 @@ class Dispatcher:
             return None
 
         env_name = request.env_name
-        rollouts = request.rollouts if request.rollouts is not None else envs.get(env_name).config.group_size
+        config = envs.get(env_name).config
+        # A down-sampled train source dispatches more rollouts than it trains on.
+        default_rollouts = config.rollouts_per_task if kind == "train" else config.group_size
+        rollouts = request.rollouts if request.rollouts is not None else default_rollouts
 
         return GroupState(
             kind=kind,

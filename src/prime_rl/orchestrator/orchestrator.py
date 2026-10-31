@@ -45,7 +45,7 @@ from prime_rl.control.plans import plan_router
 from prime_rl.control.server import ControlServer
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.routing import is_trainable
-from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch
+from prime_rl.orchestrator.annotations import stamp_arrival, stamp_batch, stamp_downsample
 from prime_rl.orchestrator.batch import BatchPacker
 from prime_rl.orchestrator.ckpt import build_state, setup_ckpt_manager
 from prime_rl.orchestrator.clients import AdminPlane, InferenceClient, setup_admin_plane
@@ -385,6 +385,7 @@ class Orchestrator:
             batch_size=config.batch_size,
             on_result=self.train_source.on_result,
             on_pool_exit=self.train_source.plans.record_selection,
+            on_downsample=self.train_source.plans.record_downsample,
         )
 
         self.eval_sink = EvalSink(eval_envs=self.eval_envs) if self.eval_envs is not None else None
@@ -583,6 +584,9 @@ class Orchestrator:
     async def handle_train_result(self, batch: TrainBatch | None) -> None:
         if self.heart is not None:
             self.heart.beat()
+        # Which rollouts of a down-sampled group train, beside their arrival records.
+        if kept_marks := self.train_sink.take_kept_marks():
+            await monitors.log_annotations(stamp_downsample(kept_marks))
         while batch is not None and not self.draining and not self.stopped.is_set():
             await self.finalize_train_batch(batch)
             if self.draining or self.stopped.is_set():
@@ -776,11 +780,11 @@ class Orchestrator:
         self.release_future = asyncio.get_running_loop().run_in_executor(None, release_and_trim, *payload)
 
     async def ship(self, micro_batch_grid: list[list[MicroBatch]]) -> float:
-        """Send a batch, which waits until every trainer rank requested it. With batch selection, results keep
-        flowing into the sinks meanwhile, so inference works through the trainer's step and the pool fills for the
-        next batch; the train sink cuts no batch until this one has shipped. The sink's staleness sweep runs again
-        before the next batch is cut, at the step it trains on, so the off-policy bound holds."""
-        if self.config.batch_selection is None:
+        """Send a batch, which waits until every trainer rank requested it. With ``ingest_while_shipping``, results
+        keep flowing into the sinks meanwhile, so inference works through the trainer's step (and a selection pool
+        fills for the next batch); the train sink cuts no batch until this one has shipped. The sink's staleness
+        sweep runs again before the next batch is cut, at the step it trains on, so the off-policy bound holds."""
+        if not self.config.ingest_while_shipping:
             return await self.sender.send(micro_batch_grid)
         send = asyncio.create_task(self.sender.send(micro_batch_grid), name="send_batch")
         self.train_sink.shipping = True

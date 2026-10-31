@@ -611,14 +611,17 @@ class RolloutWindow:
         *,
         env_name: str,
         queued_trace_ids: set[str],
+        left_out_trace_ids: set[str] = frozenset(),
     ) -> None:
+        """``left_out_trace_ids``: rollouts down-sampling left out of a trained group, neither queued nor discarded."""
         cancelled = cancellation.count if cancellation is not None else 0
         attempts = len(episodes) + len(failures) + cancelled
         self.tokens += episodes.num_total_tokens
         self.traces += episodes.num_traces
         self.groups += 1
         self.attempts += attempts
-        discarded = [episode for episode in episodes if not any(t.id in queued_trace_ids for t in episode.traces)]
+        accounted = queued_trace_ids | left_out_trace_ids
+        discarded = [episode for episode in episodes if not any(t.id in accounted for t in episode.traces)]
         self.discarded += len(discarded) + len(failures) + cancelled
         if cancellation is not None and cancellation.reason != "stale":
             self.cancelled += sum(episode.id in episodes.cancelled for episode in discarded) + cancelled
@@ -638,7 +641,9 @@ class RolloutWindow:
                 self.metrics.count(f"{prefix}/all/dispatch_failure/{failure.error.type}", 1.0)
         self.metrics.rate("rollout/env_share", {env_name: float(episodes.num_traces)}, episodes.num_traces)
         self.metrics.count("rollout/traces/queued", float(len(queued_trace_ids)))
-        self.metrics.count("rollout/traces/discarded", float(episodes.num_traces - len(queued_trace_ids)))
+        self.metrics.count("rollout/traces/discarded", float(episodes.num_traces - len(accounted)))
+        if left_out_trace_ids:
+            self.metrics.count("rollout/traces/left_out", float(len(left_out_trace_ids)))
 
 
 class EvalEpisodes(EpisodeCollection):

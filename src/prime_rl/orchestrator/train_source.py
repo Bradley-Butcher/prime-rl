@@ -52,8 +52,9 @@ class TrainSource:
         env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
         return env_name, next(self.curricula[env_name].sampler)
 
-    def on_result(self, group: list[vf.Episode]) -> bool:
-        """Report a finalized group and return whether it should train."""
+    def on_result(self, group: list[vf.Episode], kept_trace_ids: set[str] | None = None) -> bool:
+        """Report a finalized group and return whether it should train. A down-sampled group reports every rollout,
+        with ``kept_trace_ids`` the ones it trains on if admitted."""
         if not group:
             raise ValueError("Cannot report an empty rollout group")
         env_name = episode_env_name(group[0])
@@ -61,7 +62,10 @@ class TrainSource:
         if not isinstance(admitted, bool):
             raise TypeError(f"Curriculum.on_result() must return bool, got {type(admitted).__name__}")
         if self.plans is not None:
-            self.plans.observe(group)
+            if kept_trace_ids is None:
+                self.plans.observe(group)
+            else:
+                self.plans.observe(group, kept=kept_trace_ids if admitted else set())
         if admitted:
             self._admitted[env_name] += 1
         else:
