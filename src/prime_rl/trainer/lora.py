@@ -1,8 +1,13 @@
+import json
 import re
+from pathlib import Path
 from typing import Callable, List
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
+from torch.distributed.tensor import DTensor, distribute_tensor
+from transformers.utils import ADAPTER_CONFIG_NAME, ADAPTER_SAFE_WEIGHTS_NAME
 
 from prime_rl.configs.trainer import LoRAConfig
 from prime_rl.trainer.models.layers.lora import (
@@ -40,6 +45,7 @@ class LoRAState:
             torch.full((1,), config.alpha / config.rank, dtype=torch.bfloat16, device=device),
             reset_reference=True,
         )
+        self.config = config
         self.lora_num_tokens = get_lora_num_tokens()
         self.scaling_factors = get_multilora_scaling()
         self._modules: list[tuple[str, MultiLoRAModule]] = []
@@ -55,21 +61,28 @@ class LoRAState:
         """Register an adapted module with its FQN prefix (e.g. "model.layers.0.self_attn.q_proj")."""
         self._modules.append((prefix, module))
 
-    def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        """Adapter-only state dict in the adapted weights' dtype (an adapter held in another dtype, ``lora.dtype``,
-        is cast), converted for HF compatibility when a converter is registered."""
-        state_dict = {}
+    def module_state_dicts(self) -> list[tuple[str, MultiLoRAModule, dict[str, torch.Tensor]]]:
+        """Each registered module's adapter in its export format, keyed below the module's prefix, in the adapted
+        weights' dtype (an adapter held in another dtype, ``lora.dtype``, is cast)."""
+        modules = []
         for prefix, module in self._modules:
             dtype = module.base_dtype
             # MoE modules expose a custom state_dict_for_adapter returning the
             # vLLM-compatible per-expert format
             if hasattr(module, "state_dict_for_adapter"):
-                for name, tensor in module.state_dict_for_adapter(0).items():
-                    state_dict[f"{prefix}.{name}"] = tensor.detach().to(dtype)
+                tensors = module.state_dict_for_adapter(0)
             else:
-                for name, param in module.named_parameters_for_adapter(0):
-                    state_dict[f"{prefix}.{name}.weight"] = param.detach().to(dtype)
+                tensors = {f"{name}.weight": param for name, param in module.named_parameters_for_adapter(0)}
+            modules.append((prefix, module, {name: tensor.detach().to(dtype) for name, tensor in tensors.items()}))
+        return modules
 
+    def adapter_state_dict(self) -> dict[str, torch.Tensor]:
+        """Adapter-only state dict, converted for HF compatibility when a converter is registered."""
+        state_dict = {
+            f"{prefix}.{name}": tensor
+            for prefix, _, tensors in self.module_state_dicts()
+            for name, tensor in tensors.items()
+        }
         if self._adapter_state_dict_converter is not None:
             state_dict = self._adapter_state_dict_converter(state_dict)
         return state_dict
@@ -78,6 +91,100 @@ class LoRAState:
         """Reset the adapter to fresh initialization across all registered modules."""
         for _, module in self._modules:
             module.reset_parameters(0)
+
+    def load_adapter(self, path: Path) -> None:
+        """Copy an adapter as ``adapter_state_dict`` exports it (the weight broadcast's ``adapter_model.safetensors``)
+        into adapter 0, the one prime-rl trains: each tensor in its parameter's dtype, and into the local shard of a
+        sharded parameter. The keys and shapes come from exporting the adapter as it is, and the model's converter is
+        inverted key by key, so any model the export supports loads. Every parameter must be filled and every tensor
+        used, with matching shapes, and the loaded adapter must export back to the file exactly."""
+        weights_path, config_path = adapter_files(path)
+        adapter_config = json.loads(config_path.read_text())
+        rank, alpha = adapter_config.get("r"), adapter_config.get("lora_alpha")
+        if (rank, alpha) != (self.config.rank, self.config.alpha):
+            raise ValueError(
+                f"The adapter at {weights_path} has rank {rank} and alpha {alpha} ({config_path}); this run's LoRA "
+                f"has rank {self.config.rank} and alpha {self.config.alpha}"
+            )
+        weights = load_file(weights_path)
+        modules = [
+            (prefix, module, {name: tensor.shape for name, tensor in tensors.items()})
+            for prefix, module, tensors in self.module_state_dicts()
+        ]
+        names = self._exported_names([f"{prefix}.{name}" for prefix, _, shapes in modules for name in shapes])
+        expected = {names[f"{prefix}.{name}"]: shape for prefix, _, shapes in modules for name, shape in shapes.items()}
+        problems = {
+            "missing": sorted(expected.keys() - weights.keys()),
+            "extra": sorted(weights.keys() - expected.keys()),
+            "with another shape": [
+                f"{key} {tuple(weights[key].shape)}, expected {tuple(shape)}"
+                for key, shape in expected.items()
+                if key in weights and weights[key].shape != shape
+            ],
+        }
+        if any(problems.values()):
+            raise ValueError(
+                f"The adapter at {weights_path} does not fit this run's LoRA: "
+                + "; ".join(
+                    f"{len(keys)} {what} ({', '.join(keys[:5])}{', ...' if len(keys) > 5 else ''})"
+                    for what, keys in problems.items()
+                    if keys
+                )
+            )
+
+        with torch.no_grad():
+            for prefix, module, shapes in modules:
+                exported = {name: weights[names[f"{prefix}.{name}"]] for name in shapes}
+                if hasattr(module, "unpack_state_dict_for_adapter"):
+                    values = module.unpack_state_dict_for_adapter(exported)
+                else:
+                    values = {name.removesuffix(".weight"): tensor for name, tensor in exported.items()}
+                for name, param in module.named_parameters_for_adapter(0):
+                    _copy_into(param, values[name])
+
+        differing = []
+        for key, tensor in self.adapter_state_dict().items():
+            if isinstance(tensor, DTensor):
+                tensor = tensor.full_tensor()
+            if not torch.equal(tensor, weights[key].to(tensor.device, tensor.dtype)):
+                differing.append(key)
+        if differing:
+            raise RuntimeError(
+                f"The adapter loaded from {weights_path} exports differently: {', '.join(differing[:5])}"
+            )
+        get_logger().info(f"Initialized the LoRA adapter from {weights_path} ({len(weights)} tensors)")
+
+    def _exported_names(self, keys: list[str]) -> dict[str, str]:
+        """Each key's name after the model's converter, found by converting the key alone, so the converter must
+        rename keys one by one."""
+        if self._adapter_state_dict_converter is None:
+            return {key: key for key in keys}
+        names = {}
+        for key in keys:
+            marker = torch.empty(0)
+            converted = self._adapter_state_dict_converter({key: marker})
+            if len(converted) != 1 or next(iter(converted.values())) is not marker:
+                raise ValueError(f"The model's adapter converter does more than rename {key!r}, which init_from needs")
+            (names[key],) = converted
+        return names
+
+
+def adapter_files(path: Path) -> tuple[Path, Path]:
+    """An adapter's weights and config: ``path`` is the weights file or the directory holding it."""
+    weights = path / ADAPTER_SAFE_WEIGHTS_NAME if path.is_dir() else path
+    config = weights.parent / ADAPTER_CONFIG_NAME
+    for file in (weights, config):
+        if not file.is_file():
+            raise FileNotFoundError(f"No adapter file {file} (lora.init_from = {path})")
+    return weights, config
+
+
+def _copy_into(param: torch.Tensor, value: torch.Tensor) -> None:
+    """Copy a full tensor into a parameter in its dtype; a sharded parameter takes its own shard of it."""
+    value = value.to(device=param.device, dtype=param.dtype)
+    if isinstance(param, DTensor):
+        value = distribute_tensor(value, param.device_mesh, param.placements, src_data_rank=None)
+    param.copy_(value)
 
 
 _LORA_STATE: LoRAState | None = None

@@ -151,6 +151,8 @@ def train(config: SFTConfig):
 
     if config.model.lora is not None:
         get_lora_state().reset_adapter_parameters()
+        if config.model.lora.init_from is not None:
+            get_lora_state().load_adapter(config.model.lora.init_from)
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)

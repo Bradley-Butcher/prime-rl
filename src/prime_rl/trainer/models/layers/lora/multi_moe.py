@@ -32,6 +32,19 @@ def _run_lora_grouped_mm(
     return lora_out
 
 
+def _stack_experts(
+    state_dict: dict[str, torch.Tensor], num_experts: int, projections: tuple[str, ...]
+) -> dict[str, torch.Tensor]:
+    """Per-expert ``{expert_id}.{proj}.lora_{A,B}.weight`` tensors stacked into each ``{proj}_lora_{A,B}``."""
+    return {
+        f"{proj}_lora_{matrix}": torch.stack(
+            [state_dict[f"{expert_id}.{proj}.lora_{matrix}.weight"] for expert_id in range(num_experts)]
+        )
+        for proj in projections
+        for matrix in ("A", "B")
+    }
+
+
 class MultiLoRAGroupedExperts(MultiLoRAModule):
     """
     Gated GroupedExperts + multi-LoRA with grouped GEMM.
@@ -275,6 +288,11 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
 
         return state_dict
 
+    def unpack_state_dict_for_adapter(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The inverse of ``state_dict_for_adapter``: each adapter parameter, by its ``named_parameters_for_adapter``
+        name, stacked from its per-expert tensors."""
+        return _stack_experts(state_dict, self.num_experts, ("gate_proj", "down_proj", "up_proj"))
+
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         # TODO: We assume theres only one adapter active in a sequence for now
         # Being able to route multi-adapter sequences efficiently requires two things that are tricky
@@ -490,6 +508,11 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
 
         return state_dict
 
+    def unpack_state_dict_for_adapter(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The inverse of ``state_dict_for_adapter``: each adapter parameter, by its ``named_parameters_for_adapter``
+        name, stacked from its per-expert tensors."""
+        return _stack_experts(state_dict, self.num_experts, ("up_proj", "down_proj"))
+
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:
         adapter_idx = self._lora_num_tokens.argmax().item()
         up_proj_lora_a = self.up_proj_lora_A[adapter_idx]
@@ -700,6 +723,19 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
             "base_layer.lora_B.weight": gu_b_flat,
             "lora_A.weight": d_a_flat,
             "lora_B.weight": d_b_flat,
+        }
+
+    def unpack_state_dict_for_adapter(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The inverse of ``state_dict_for_adapter``: each adapter parameter, by its ``named_parameters_for_adapter``
+        name, with its experts unstacked from the rank dim."""
+        experts, rank = self.num_experts, self.rank
+        return {
+            "gate_up_lora_A": state_dict["base_layer.lora_A.weight"].reshape(experts, rank, self.hidden_size),
+            "gate_up_lora_B": state_dict["base_layer.lora_B.weight"]
+            .reshape(self.gate_up_out, rank, experts)
+            .permute(2, 0, 1),
+            "down_lora_A": state_dict["lora_A.weight"].reshape(experts, rank, self.intermediate_size),
+            "down_lora_B": state_dict["lora_B.weight"].reshape(self.hidden_size, rank, experts).permute(2, 0, 1),
         }
 
     def forward(self, x: torch.Tensor, num_tokens_per_expert: torch.Tensor) -> torch.Tensor:

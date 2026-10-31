@@ -189,6 +189,8 @@ dropout = 0.0
 
 The adapter's parameters take the base layers' dtype (`optimization_dtype`) unless `dtype` sets their own. A bf16 weight drops any Adam step smaller than half a bf16 unit, which at a small learning rate is most of them, so with `optimization_dtype = "bfloat16"` (required for VLMs) set `dtype = "float32"`: the adapter, its gradients and its optimizer state are fp32 while the base stays bf16, the forward still computes in bf16 (FSDP's param dtype), checkpoints keep fp32, and broadcasts cast the adapter to the base dtype. FSDP needs one dtype across a unit's trainable parameters, so `modules_to_save` cannot be combined with a `dtype` other than `optimization_dtype`.
 
+`init_from` starts the adapter from a saved one instead of a fresh one: an `adapter_model.safetensors` as a LoRA run's broadcast writes it (`broadcasts/step_N`), or its directory, with `adapter_config.json` beside it. Its rank and alpha must match the run's, every adapter parameter must be filled and every tensor in the file used, with matching shapes; anything else fails at startup naming the keys. The tensors load into each parameter's dtype and FSDP shard, the optimizer starts fresh, and the first broadcast reproduces the file exactly (checked at load). A checkpoint resume restores the checkpoint's adapter instead.
+
 LoRA is supported across SFT and RL. NCCL weight broadcast is **not** supported with LoRA — the default NCCL transport automatically falls back to filesystem when LoRA is enabled. Broadcast dirs of LoRA runs contain the raw adapter (`adapter_model.safetensors` + `adapter_config.json`). With LoRA on, the inference server registers the adapter under the model name and serves the base model as `<model>-base`.
 
 ## Disaggregated Prefill/Decode Inference

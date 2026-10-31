@@ -101,6 +101,13 @@ class LoRAConfig(BaseConfig):
     weight, which bf16 weights round away; the base stays in ``optimization_dtype``, the forward still computes in
     bf16 (FSDP's param dtype), and the adapter is broadcast to inference in the base layers' dtype."""
 
+    init_from: Path | None = None
+    """An adapter to start from instead of a fresh one: an ``adapter_model.safetensors`` as the weight broadcast writes
+    it each step (``broadcasts/step_N``), or the directory holding it, with its ``adapter_config.json`` beside it. Its
+    rank and alpha must match these; it must fill every adapter parameter, in the parameter's dtype, and every tensor
+    in it must be used. The optimizer starts fresh, and a checkpoint resume restores the checkpoint's adapter instead.
+    None starts from a fresh adapter."""
+
 
 class DebugModelConfig(BaseConfig):
     num_layers: int | None = None
