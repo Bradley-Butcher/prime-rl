@@ -95,6 +95,12 @@ class LoRAConfig(BaseConfig):
     modules_to_save: list[str] = []
     """Module names or regex patterns to keep fully trainable (not freeze). Same matching rules as ``target_modules``."""
 
+    dtype: Literal["bfloat16", "float32"] | None = None
+    """dtype of the adapter's parameters, which the optimizer updates in place. None keeps the base layers' dtype
+    (``optimization_dtype``). ``float32`` over a ``bfloat16`` base keeps updates smaller than half a bf16 unit of a
+    weight, which bf16 weights round away; the base stays in ``optimization_dtype``, the forward still computes in
+    bf16 (FSDP's param dtype), and the adapter is broadcast to inference in the base layers' dtype."""
+
 
 class DebugModelConfig(BaseConfig):
     num_layers: int | None = None
@@ -323,6 +329,18 @@ class ModelConfig(BaseModelConfig):
         """Activation offloading requires activation checkpointing, so ``ac = None`` disables both."""
         if self.ac is None:
             self.ac_offloading = None
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_dtype(self):
+        """FSDP needs one dtype across a unit's trainable parameters, so a fully trained module would mix with the
+        adapter's dtype in its transformer block's unit."""
+        lora = self.lora
+        if lora is not None and lora.dtype not in (None, self.optimization_dtype) and lora.modules_to_save:
+            raise ValueError(
+                f"lora.dtype = {lora.dtype!r} differs from optimization_dtype = {self.optimization_dtype!r}, which "
+                "lora.modules_to_save would train in; leave modules_to_save empty or lora.dtype unset."
+            )
         return self
 
     @model_validator(mode="after")

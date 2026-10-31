@@ -46,6 +46,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
         n_adapters: int,
         alpha: float = 32.0,
         dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(base_layer)
         if rank <= 0 or n_adapters <= 0:
@@ -77,7 +78,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         rank,
                         self.dim,
                         device=base_layer.gate_proj.device,
-                        dtype=base_layer.gate_proj.dtype,
+                        dtype=dtype or base_layer.gate_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -91,7 +92,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         self.hidden_dim,
                         rank,
                         device=base_layer.gate_proj.device,
-                        dtype=base_layer.gate_proj.dtype,
+                        dtype=dtype or base_layer.gate_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -107,7 +108,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         rank,
                         self.hidden_dim,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -121,7 +122,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         self.dim,
                         rank,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -137,7 +138,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         rank,
                         self.dim,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -151,7 +152,7 @@ class MultiLoRAGroupedExperts(MultiLoRAModule):
                         self.hidden_dim,
                         rank,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -353,6 +354,7 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
         n_adapters: int,
         alpha: float = 32.0,
         dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(base_layer)
         if rank <= 0 or n_adapters <= 0:
@@ -385,7 +387,7 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
                         rank,
                         self.dim,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -399,7 +401,7 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
                         self.hidden_dim,
                         rank,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -415,7 +417,7 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
                         rank,
                         self.hidden_dim,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -429,7 +431,7 @@ class MultiLoRANonGatedGroupedExperts(MultiLoRAModule):
                         self.dim,
                         rank,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -545,6 +547,7 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
         n_adapters: int,
         alpha: float = 32.0,
         dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__(base_layer)
         if rank <= 0 or n_adapters <= 0:
@@ -580,7 +583,7 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
                         rank,
                         self.hidden_size,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -594,7 +597,7 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
                         self.gate_up_out,
                         rank,
                         device=base_layer.up_proj.device,
-                        dtype=base_layer.up_proj.dtype,
+                        dtype=dtype or base_layer.up_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -609,7 +612,7 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
                         rank,
                         self.intermediate_size,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -623,7 +626,7 @@ class MultiLoRAGptOssGroupedExperts(MultiLoRAModule):
                         self.hidden_size,
                         rank,
                         device=base_layer.down_proj.device,
-                        dtype=base_layer.down_proj.dtype,
+                        dtype=dtype or base_layer.down_proj.dtype,
                     )
                 )
                 for _ in range(n_adapters)

@@ -47,6 +47,7 @@ class MultiLoRALinear(MultiLoRAModule):
         n_adapters: int,
         alpha: float = 32.0,
         dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
         use_grouped_mm: bool = True,
     ):
         super().__init__(base_layer)
@@ -76,7 +77,7 @@ class MultiLoRALinear(MultiLoRAModule):
                         rank,
                         self.in_features,
                         device=self.base_layer.weight.device,
-                        dtype=self.base_layer.weight.dtype,
+                        dtype=dtype or self.base_layer.weight.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -90,7 +91,7 @@ class MultiLoRALinear(MultiLoRAModule):
                         self.out_features,
                         rank,
                         device=self.base_layer.weight.device,
-                        dtype=self.base_layer.weight.dtype,
+                        dtype=dtype or self.base_layer.weight.dtype,
                     )
                 )
                 for _ in range(n_adapters)
@@ -146,8 +147,10 @@ class MultiLoRALinear(MultiLoRAModule):
         base_out = self.base_layer(x)
         lora_x = self.lora_dropout(x)
 
-        combined_lora_A = torch.stack([i for i in self.lora_A], dim=0)
-        combined_lora_B = torch.stack([i for i in self.lora_B], dim=0)
+        # FSDP's param dtype has already cast the adapter for compute; this covers an adapter held in another dtype
+        # outside it.
+        combined_lora_A = torch.stack([i for i in self.lora_A], dim=0).to(lora_x.dtype)
+        combined_lora_B = torch.stack([i for i in self.lora_B], dim=0).to(lora_x.dtype)
         if self.use_grouped_mm:
             lora_out = _run_lora_grouped_mm(lora_x, combined_lora_A, combined_lora_B, offsets)
         else:

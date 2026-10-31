@@ -56,17 +56,19 @@ class LoRAState:
         self._modules.append((prefix, module))
 
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        """Adapter-only state dict, converted for HF compatibility when a converter is registered."""
+        """Adapter-only state dict in the adapted weights' dtype (an adapter held in another dtype, ``lora.dtype``,
+        is cast), converted for HF compatibility when a converter is registered."""
         state_dict = {}
         for prefix, module in self._modules:
+            dtype = module.base_dtype
             # MoE modules expose a custom state_dict_for_adapter returning the
             # vLLM-compatible per-expert format
             if hasattr(module, "state_dict_for_adapter"):
                 for name, tensor in module.state_dict_for_adapter(0).items():
-                    state_dict[f"{prefix}.{name}"] = tensor.detach()
+                    state_dict[f"{prefix}.{name}"] = tensor.detach().to(dtype)
             else:
                 for name, param in module.named_parameters_for_adapter(0):
-                    state_dict[f"{prefix}.{name}.weight"] = param.detach()
+                    state_dict[f"{prefix}.{name}.weight"] = param.detach().to(dtype)
 
         if self._adapter_state_dict_converter is not None:
             state_dict = self._adapter_state_dict_converter(state_dict)
@@ -245,6 +247,9 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
     if not target_modules:
         raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
 
+    dtype = getattr(torch, config.dtype) if config.dtype is not None else None
+    if dtype is not None:
+        logger.info(f"LoRA adapter parameters in {config.dtype}")
     for module_name in target_modules:
         base_module = _get_module_by_name(model, module_name)
 
@@ -256,6 +261,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
                 n_adapters=1,
                 alpha=config.alpha,
                 dropout=config.dropout,
+                dtype=dtype,
             )
         # Handle GroupedExperts (MoE)
         elif isinstance(base_module, GroupedExperts):
@@ -271,6 +277,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
                 n_adapters=1,
                 alpha=config.alpha,
                 dropout=config.dropout,
+                dtype=dtype,
             )
         else:
             logger.warning(

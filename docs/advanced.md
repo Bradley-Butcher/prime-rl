@@ -187,6 +187,8 @@ dropout = 0.0
 
 `target_modules` defaults to a reasonable cross-family set (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `experts`, plus a few latent-projection names for Nemotron). Unknown names are silently ignored, so the defaults work across architectures. Add architecture-specific names to extend coverage (e.g. `in_proj` / `out_proj` for Mamba).
 
+The adapter's parameters take the base layers' dtype (`optimization_dtype`) unless `dtype` sets their own. A bf16 weight drops any Adam step smaller than half a bf16 unit, which at a small learning rate is most of them, so with `optimization_dtype = "bfloat16"` (required for VLMs) set `dtype = "float32"`: the adapter, its gradients and its optimizer state are fp32 while the base stays bf16, the forward still computes in bf16 (FSDP's param dtype), checkpoints keep fp32, and broadcasts cast the adapter to the base dtype. FSDP needs one dtype across a unit's trainable parameters, so `modules_to_save` cannot be combined with a `dtype` other than `optimization_dtype`.
+
 LoRA is supported across SFT and RL. NCCL weight broadcast is **not** supported with LoRA — the default NCCL transport automatically falls back to filesystem when LoRA is enabled. Broadcast dirs of LoRA runs contain the raw adapter (`adapter_model.safetensors` + `adapter_config.json`). With LoRA on, the inference server registers the adapter under the model name and serves the base model as `<model>-base`.
 
 ## Disaggregated Prefill/Decode Inference

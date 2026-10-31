@@ -120,6 +120,11 @@ class MultiLoRAModule(nn.Module):
         """
         ...
 
+    @property
+    def base_dtype(self) -> torch.dtype:
+        """The adapted weights' dtype, which the adapter is exported in whatever its parameters' dtype."""
+        return next(param.dtype for param in self.base_layer.parameters() if param.is_floating_point())
+
     def __getattr__(self, name: str) -> Any:
         """Forward missing attributes to wrapped module."""
         try:
