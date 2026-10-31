@@ -93,6 +93,12 @@ class SharedCheckpointConfig(BaseConfig):
     keep_interval: int | None = Field(None, ge=1)
     """Keep checkpoints at every N steps permanently (e.g. ``keep_interval=100`` keeps step 100, 200, ...). If None, no interval-based keeping."""
 
+    trainable_only: bool | None = None
+    """The trainer checkpoints only its trainable parameters (``trainer.ckpt.trainable_only``)."""
+
+    resume_lr: Literal["checkpoint", "config"] | None = None
+    """The learning rate a resumed trainer trains at (``trainer.ckpt.resume_lr``)."""
+
 
 class SharedModelConfig(BaseConfig):
     name: str = "Qwen/Qwen3-0.6B"

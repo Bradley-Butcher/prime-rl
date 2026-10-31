@@ -8,7 +8,15 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_model_state_dict, set_state_dict
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_state_dict,
+    set_model_state_dict,
+    set_state_dict,
+)
+from torch.distributed.checkpoint.state_dict import _get_fqns as get_fqns
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from torch.distributed.checkpoint.stateful import Stateful
@@ -24,6 +32,7 @@ from prime_rl.trainer.models.fusions import (
     split_packed_optimizer_state_for_checkpoint,
     write_back_loaded_packed_optimizer_state,
 )
+from prime_rl.trainer.models.layers.lora.base import _LORA_PREFIX
 from prime_rl.trainer.optim import OffloadOptimizer, OptimizerLike
 from prime_rl.trainer.utils import get_dcp_group
 from prime_rl.trainer.world import get_world
@@ -36,6 +45,48 @@ class Progress:
     step: int = 1
     total_tokens: int = 0
     total_samples: int = 0
+
+
+TRAINABLE_ONLY_MARKER = "trainable_only"
+"""A file in a trainer checkpoint that holds only the trainable parameters (``ckpt.trainable_only``)."""
+
+
+def is_trainable_only(path: Path) -> bool:
+    """Whether the trainer checkpoint at ``path`` leaves the frozen parameters to the model load."""
+    return (path / TRAINABLE_ONLY_MARKER).exists()
+
+
+def frozen_keys(model: nn.Module) -> set[str]:
+    """The model state dict's keys of its frozen parameters. A LoRA module's state dict drops its ``base_layer.``
+    (``MultiLoRAModule``), so torch's own ``ignore_frozen_params`` cannot find them."""
+    return {
+        fqn.replace(_LORA_PREFIX, "")
+        for name, param in model.named_parameters()
+        if not param.requires_grad
+        for fqn in get_fqns(model, name)
+    }
+
+
+def check_trainable_coverage(path: Path, model: nn.Module) -> None:
+    """Refuse a trainable-only checkpoint that does not hold exactly the model's trainable parameters (and its
+    buffers), naming what is missing or extra."""
+    prefix = "app.model."
+    saved = {
+        key.removeprefix(prefix)
+        for key in FileSystemReader(path).read_metadata().state_dict_metadata
+        if key.startswith(prefix)
+    }
+    expected = set(get_model_state_dict(model)) - frozen_keys(model)
+    problems = {"missing": sorted(expected - saved), "extra": sorted(saved - expected)}
+    if any(problems.values()):
+        raise ValueError(
+            f"The trainable-only checkpoint at {path} does not hold exactly this run's trainable parameters: "
+            + "; ".join(
+                f"{len(keys)} {what} ({', '.join(keys[:5])}{', ...' if len(keys) > 5 else ''})"
+                for what, keys in problems.items()
+                if keys
+            )
+        )
 
 
 def _try_rmtree(path: Path, logger) -> None:
@@ -61,11 +112,16 @@ class AppState(Stateful):
         optimizers: list[OptimizerLike],
         scheduler: LRScheduler | None,
         progress: Progress | None,
+        trainable_only: bool = False,
     ):
         self.model = model
         self.optimizers = optimizers
         self.scheduler = scheduler
         self.progress = progress
+        # A trainable-only state leaves the frozen parameters out, and loads without them: the model
+        # load provides them, and ``check_trainable_coverage`` checks the rest beforehand.
+        self.trainable_only = trainable_only
+        self.options = StateDictOptions(strict=not trainable_only)
 
     def _get_checkpoint_optimizers(self) -> list[Optimizer]:
         """Expose optimizers keyed by their model parameters for DCP."""
@@ -85,6 +141,9 @@ class AppState(Stateful):
         # Automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
         checkpoint_optimizers = self._get_checkpoint_optimizers()
         model_state_dict, optimizer_state_dict = get_state_dict(self.model, checkpoint_optimizers)
+        if self.trainable_only:
+            frozen = frozen_keys(self.model)
+            model_state_dict = {key: value for key, value in model_state_dict.items() if key not in frozen}
         # Runtime fusions own one physical state tensor per fused parameter; the checkpoint
         # sees it under the canonical names. This dict is also the template dcp_load writes
         # into, and load_state_dict packs the loaded entries back into the runtime state.
@@ -126,7 +185,7 @@ class AppState(Stateful):
             # detaching optim.state from the tensors we just populated. So we only
             # apply the model side here and flip the wrappers to initialized so
             # subsequent steps take the steady-state path.
-            set_model_state_dict(self.model, model_state_dict=state_dict["model"])
+            set_model_state_dict(self.model, model_state_dict=state_dict["model"], options=self.options)
             # The template only aliases a packed parameter's state where the packing
             # dimension is unsharded, so the loaded logical entries are packed back in.
             write_back_loaded_packed_optimizer_state(self.model, checkpoint_optimizers, state_dict["optimizers"])
@@ -144,6 +203,7 @@ class AppState(Stateful):
                 optim_state_dict=join_loaded_optimizer_state_for_runtime(
                     self.model, state_dict["optimizers"], runtime_optimizer_state_dict
                 ),
+                options=self.options,
             )
 
         if self.scheduler is not None:
@@ -173,6 +233,11 @@ class CheckpointManager:
         """Get the path to write the trainer checkpoint for a given step."""
         return get_step_path(self.ckpt_dir, step) / "trainer"
 
+    def restores_frozen_parameters(self, step: int, path: Path | None = None) -> bool:
+        """Whether resuming from the checkpoint of ``step`` (or at ``path``) restores the frozen parameters
+        too, so the model need not load them; a trainable-only checkpoint leaves them to the model load."""
+        return not is_trainable_only(path if path is not None else self.get_ckpt_path(step))
+
     def save_to_path(
         self,
         path: Path,
@@ -187,7 +252,8 @@ class CheckpointManager:
         start_time = time.perf_counter()
 
         # Create checkpoint state
-        state_dict = {"app": AppState(model, optimizers, scheduler, progress)}
+        trainable_only = self.config.trainable_only
+        state_dict = {"app": AppState(model, optimizers, scheduler, progress, trainable_only=trainable_only)}
 
         # Checkpoint the local dataloader
         if dataloader is not None:
@@ -200,8 +266,12 @@ class CheckpointManager:
             torch.distributed.barrier(group=get_dcp_group())
             torch.save(dataloader.state_dict(), dataloader_dir / f"rank_{self.world.rank}.pt")
 
-        # Save sharded state
-        dcp_save(state_dict, checkpoint_id=path, process_group=get_dcp_group())
+        # Save sharded state. A trainable-only checkpoint writes one file per tensor, so no file
+        # outgrows the adapter's largest tensor (object stores cap a file's size).
+        storage_writer = FileSystemWriter(path, single_file_per_rank=False) if trainable_only else None
+        dcp_save(state_dict, checkpoint_id=path, storage_writer=storage_writer, process_group=get_dcp_group())
+        if trainable_only and self.world.is_master:
+            (path / TRAINABLE_ONLY_MARKER).touch()
 
         self.logger.debug(f"Saved training checkpoint in {format_time(time.perf_counter() - start_time)}")
 
@@ -218,8 +288,15 @@ class CheckpointManager:
         self.logger.debug(f"Loading training checkpoint from {path}")
         start_time = time.perf_counter()
 
+        # A trainable-only checkpoint loads into a model whose frozen base came from the model load.
+        trainable_only = is_trainable_only(path)
+        if trainable_only:
+            check_trainable_coverage(path, model)
+
         # Load sharded state
-        app_state = AppState(model, optimizers if not self.skip_optimizer else [], scheduler, progress)
+        app_state = AppState(
+            model, optimizers if not self.skip_optimizer else [], scheduler, progress, trainable_only=trainable_only
+        )
         state_dict = {"app": app_state}
         dcp_load(state_dict=state_dict, checkpoint_id=path, process_group=get_dcp_group())
         # DCP materializes the optimizer state with a zero-grad step, which allocates a full set of

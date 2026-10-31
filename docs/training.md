@@ -343,6 +343,8 @@ uv run rl @ rl.toml --max-steps 20 --ckpt --run.name my-fork \
   --resume.dir outputs/my-run/checkpoints/step_10
 ```
 
+A resume reads `<run_dir>/checkpoints/step_<N>/trainer` and `.../orchestrator` (or `ckpt.output_dir`'s), and the orchestrator's curriculum records under `<run_dir>/curriculum/`, where its plans live. A trainer checkpoint holds the whole model by default. With `ckpt.trainable_only = true` it holds only the trainable parameters (a LoRA run's adapter, in its own dtype) with the optimizer state, scheduler and progress, one file per tensor: a resume loads the frozen base as a fresh start does and refuses a checkpoint that does not hold exactly the run's trainable parameters. A resumed run trains at its checkpoint's learning rate; with `ckpt.resume_lr = "config"` it restarts the config's schedule (`optim.lr`, warmup, decay) at the checkpoint's step instead, whatever scheduler the checkpoint used, keeping Adam's moments.
+
 ### Pausing a Live Run
 
 With `--trainer.control` and `--orchestrator.control` (SFT: `--control`), the trainer serves a small control API on port 8040 and the orchestrator on 8041. Each saves only its own state, so a pause asks the trainer first: it accepts the pause at its next step N, trains N, saves it and stops. The orchestrator is then asked to pause at N and saves its state as of shipping N, which it can always do because a paused trainer never requests N + 1. A pause is `committed` on each once that component saved N, and the run continues with `--resume`:

@@ -23,7 +23,7 @@ from prime_rl.trainer.models.layers.lm_head import IGNORE_INDEX
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
 from prime_rl.utils.logger import format_time, setup_logger
 from prime_rl.trainer.optim import setup_optimizer
-from prime_rl.trainer.scheduler import setup_scheduler
+from prime_rl.trainer.scheduler import restart_scheduler, setup_scheduler
 from prime_rl.trainer.model import (
     forward,
     get_full_offload_dtype_policy,
@@ -141,9 +141,13 @@ def train(config: SFTConfig):
             if checkpoint_step is None:
                 checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
 
-    # Initialize the model and tokenizer
+    resume_path = config.resume.dir / "trainer" if config.resume is not None and config.resume.dir is not None else None
+
+    # Initialize the model and tokenizer; a trainable-only checkpoint leaves the frozen base to this load
     logger.info(f"Initializing model ({config.model})")
-    loading_from_ckpt_later = checkpoint_step is not None
+    loading_from_ckpt_later = checkpoint_step is not None and ckpt_manager.restores_frozen_parameters(
+        checkpoint_step, resume_path
+    )
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
 
     if parallel_dims.cp_enabled:
@@ -206,17 +210,21 @@ def train(config: SFTConfig):
     progress = Progress()
 
     if checkpoint_step is not None:
-        resume_dir = config.resume.dir if config.resume else None
         skip = config.ckpt or CheckpointConfig()
+        # ``resume_lr = "config"`` restarts the config's schedule at the checkpoint's step; ``skip_scheduler``
+        # starts a fresh one over the remaining steps instead.
+        restart_lr = skip.resume_lr == "config" and not skip.skip_scheduler
         ckpt_manager.load(
             checkpoint_step,
             model,
             [optimizer],
-            scheduler if not skip.skip_scheduler else None,
+            scheduler if not (skip.skip_scheduler or restart_lr) else None,
             progress,
             dataloader=dataloader if not skip.skip_dataloader else None,
-            path=resume_dir / "trainer" if resume_dir is not None else None,
+            path=resume_path,
         )
+        if restart_lr:
+            scheduler = restart_scheduler(optimizer, config.scheduler, scheduler_steps, config.optim.lr, progress.step)
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         # This redundant setup is necessary because loading the optimizer's state has side effects on the scheduler state dict

@@ -16,7 +16,7 @@ import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, record_function
 from prime_rl.trainer.ckpt import Progress, setup_ckpt_manager
 from prime_rl.trainer.optim import setup_optimizer
-from prime_rl.trainer.scheduler import setup_scheduler
+from prime_rl.trainer.scheduler import restart_scheduler, setup_scheduler
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader, prepare_micro_batch
 from prime_rl.utils.cp import (
@@ -136,10 +136,14 @@ def train(config: TrainerConfig):
             if checkpoint_step is None:
                 checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
 
-    # Initialize the model
+    resume_path = config.resume.dir / "trainer" if config.resume is not None and config.resume.dir is not None else None
+
+    # Initialize the model; a trainable-only checkpoint leaves the frozen base to this load
     logger.info(f"Initializing model ({config.model})")
     t0 = time.perf_counter()
-    loading_from_ckpt_later = checkpoint_step is not None
+    loading_from_ckpt_later = checkpoint_step is not None and ckpt_manager.restores_frozen_parameters(
+        checkpoint_step, resume_path
+    )
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
     logger.debug(f"Initialized model in {format_time(time.perf_counter() - t0)}")
 
@@ -210,15 +214,17 @@ def train(config: TrainerConfig):
     # Optionally, resume training from a checkpoint
     progress = Progress()
     if checkpoint_step is not None:
-        resume_dir = config.resume.dir if config.resume else None
+        # ``resume_lr = "config"`` restarts the config's schedule at the checkpoint's step instead of
+        # reading the saved scheduler, whose state need not even match this config's scheduler type.
+        restart_lr = ckpt_manager.config.resume_lr == "config"
         ckpt_manager.load(
-            checkpoint_step,
-            model,
-            [optimizer],
-            scheduler,
-            progress,
-            path=resume_dir / "trainer" if resume_dir is not None else None,
+            checkpoint_step, model, [optimizer], None if restart_lr else scheduler, progress, path=resume_path
         )
+        if restart_lr:
+            scheduler = restart_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr, progress.step)
+            logger.info(
+                f"Restarted the learning rate schedule at step {progress.step}: lr {scheduler.get_last_lr()[0]:.2e}"
+            )
         # The checkpoint finished step ``checkpoint_step``; resume training at the next step.
         progress.step += 1
         logger.info(

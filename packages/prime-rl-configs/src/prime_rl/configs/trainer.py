@@ -494,6 +494,18 @@ class CheckpointConfig(BaseConfig):
     skip_optimizer: bool = False
     """Skip loading the optimizer state from checkpoint."""
 
+    trainable_only: bool = False
+    """Checkpoint only the trainable parameters (a LoRA run's adapter, in its own dtype) with the optimizer state,
+    scheduler and progress, none of the frozen base, and one file per tensor so no file outgrows the adapter's largest
+    tensor. A resume tells the kinds apart: from a trainable-only checkpoint it loads the base as a fresh start does,
+    and the checkpoint must hold exactly the run's trainable parameters."""
+
+    resume_lr: Literal["checkpoint", "config"] = "checkpoint"
+    """The learning rate a resumed run trains at. ``checkpoint`` restores the optimizer's and scheduler's. ``config``
+    restarts this config's schedule (``optim.lr`` and the scheduler's warmup, decay and min_lr) at the checkpoint's
+    step, so a run resumed past warmup at a new lr trains at it from its first step, and the scheduler's saved state,
+    whatever its type, is not read. Adam's moments are restored either way; only the step size changes."""
+
 
 class IPOLossConfig(BaseConfig):
     type: Literal["ipo"] = "ipo"

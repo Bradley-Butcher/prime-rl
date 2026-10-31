@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 
@@ -119,3 +121,25 @@ def setup_scheduler(
             )
         case _:
             raise ValueError(f"Invalid scheduler type: {scheduler_config.type}")
+
+
+def restart_scheduler(
+    optimizer: OptimizerLike,
+    scheduler_config: SchedulerConfig,
+    max_steps: int | None,
+    lr: float,
+    steps: int,
+) -> LRScheduler:
+    """The config's schedule at ``lr``, advanced ``steps`` steps, for a run resumed with ``ckpt.resume_lr =
+    "config"``. A loaded optimizer carries its checkpoint's ``lr`` and ``initial_lr``, which a new scheduler would
+    take as its base, so both are reset to ``lr`` first. Adam's moments are left as loaded."""
+    for group in _get_base_optimizer(optimizer).param_groups:
+        group["lr"] = lr
+        group["initial_lr"] = lr
+    scheduler = setup_scheduler(optimizer, scheduler_config, max_steps, lr)
+    with warnings.catch_warnings():
+        # The schedule replays steps this process never took an optimizer step for.
+        warnings.filterwarnings("ignore", message="Detected call of `lr_scheduler.step\\(\\)` before")
+        for _ in range(steps):
+            scheduler.step()
+    return scheduler
