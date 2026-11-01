@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import verifiers.v1 as vf
 
 from prime_rl.configs.algorithm import AlgoConfig, FrozenModelConfig
@@ -113,6 +116,12 @@ class Algorithm:
 
     async def score_group(self, episodes: list[vf.Episode]) -> None:
         """Assign group-relative annotations to a finalized cohort."""
+
+    @contextmanager
+    def admission_view(self, episodes: list[vf.Episode]) -> Iterator[None]:
+        """Held while the admission gates judge a scored cohort: what they read off its traces is what
+        :meth:`score_group` assigned, unless an algorithm shows them something else for the while."""
+        yield
 
     async def finalize_episode(self, episode: vf.Episode) -> None:
         """Run rollout-local scoring when the episode has trainable traces."""
