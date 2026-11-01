@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import numpy as np
 import verifiers.v1 as vf
 
@@ -123,6 +126,12 @@ class Algorithm:
 
     def reconfigure(self, config: AlgoConfig) -> None:
         """Adopt a live config update, in which only fields marked LIVE can differ."""
+
+    @contextmanager
+    def admission_view(self, episodes: list[vf.Episode]) -> Iterator[None]:
+        """Held while the admission gates judge a scored cohort: what they read off its traces is what
+        :meth:`score_group` assigned, unless an algorithm shows them something else for the while."""
+        yield
 
     async def finalize_episode(self, episode: vf.Episode) -> None:
         """Run rollout-local scoring when the episode has trainable traces."""

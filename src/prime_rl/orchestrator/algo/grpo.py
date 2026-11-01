@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -52,17 +53,41 @@ def _length_penalty_tokens(trace: vf.Trace, subagent_token_weight: float) -> tup
     return output_tokens, input_tokens
 
 
-def shape_reward(trace: vf.Trace, shaping: RewardShapingConfig) -> tuple[float, str | None]:
-    """The reward GRPO's baseline and advantage take for ``trace`` under ``shaping``, and the lever that changed it
-    (``"unfinished"`` or ``"stuck"``), if one did. A trace without the stuck metric keeps its reward."""
-    if shaping.unfinished.reward is not None and is_unfinished(trace):
-        return shaping.unfinished.reward, "unfinished"
-    reward, stuck = trace.reward, shaping.stuck
-    count = trace.metrics.get(stuck.metric)
-    if reward <= 0 or stuck.per_call == 0 or count is None:
-        return reward, None
-    factor = stuck.factor(count)
-    return (reward * factor, "stuck") if factor < 1 else (reward, None)
+def shape_rewards(
+    traces: Sequence[vf.Trace], shaping: RewardShapingConfig, *, pass_turns: bool = True
+) -> list[tuple[float, tuple[str, ...]]]:
+    """The reward GRPO's baseline and advantages take for each of a group's ``traces`` under ``shaping``, and the
+    levers that changed it, of ``"unfinished"``, ``"stuck"`` and ``"pass_turns"``.
+
+    An unfinished rollout takes ``unfinished.reward`` when it is set. Every other rollout with a positive reward is a
+    pass: its reward is cut for its stuck calls (a trace without the stuck metric is not cut) and then, unless
+    ``pass_turns`` is False, for its turns relative to the group's other passes. A failure keeps its reward."""
+    rewards: list[float] = []
+    levers: list[tuple[str, ...]] = []
+    passes: list[int] = []
+    stuck = shaping.stuck
+    for index, trace in enumerate(traces):
+        if shaping.unfinished.reward is not None and is_unfinished(trace):
+            rewards.append(shaping.unfinished.reward)
+            levers.append(("unfinished",))
+            continue
+        reward, changed = trace.reward, ()
+        if reward > 0:
+            passes.append(index)
+            count = trace.metrics.get(stuck.metric)
+            if stuck.per_call > 0 and count is not None and (factor := stuck.factor(count)) < 1:
+                reward, changed = reward * factor, ("stuck",)
+        rewards.append(reward)
+        levers.append(changed)
+    if pass_turns and shaping.pass_turns.weight > 0 and len(passes) >= 2:
+        turns = [traces[index].num_turns for index in passes]
+        fewest, most = min(turns), max(turns)
+        for index, count in zip(passes, turns, strict=True):
+            factor = shaping.pass_turns.factor(count, fewest, most)
+            if factor < 1:
+                rewards[index] *= factor
+                levers[index] += ("pass_turns",)
+    return list(zip(rewards, levers, strict=True))
 
 
 class GRPOAlgorithm(Algorithm):
@@ -90,8 +115,6 @@ class GRPOAlgorithm(Algorithm):
         return self.shaping_at(train_work(episodes[0]).step)
 
     async def score_group(self, episodes: list[vf.Episode]) -> None:
-        import torch  # only the trainer-side extras ship torch; an eval process never scores a group
-
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         shaping = self.shaping_for(episodes)
         if shaping.stuck.per_call > 0 and not self.warned_missing_metric:
@@ -101,8 +124,27 @@ class GRPOAlgorithm(Algorithm):
                     f"The stuck penalty is on, but a rollout has no {shaping.stuck.metric!r} metric; such rollouts "
                     "keep their reward"
                 )
+        for trace, advantage in zip(traces, self.group_advantages(traces, shaping), strict=True):
+            assign_advantages(trace, advantage)
+        nodes = [node for trace in traces for node in trainable_nodes(trace)]
+        if self.loss_aggregation == "prompt" and nodes:
+            # rl weight 1/T_q per token: each group's weights sum to 1, and the trainer divides the
+            # rl loss by the sum of rl weights, i.e. the number of groups.
+            weight = 1.0 / sum(int(np.count_nonzero(node.mask)) for node in nodes)
+            for node in nodes:
+                rl = np.where(np.asarray(node.mask, dtype=bool), weight, 0.0).astype(np.float32)
+                node.loss_weights = {**(node.loss_weights or {}), "rl": rl}
+
+    def group_advantages(
+        self, traces: list[vf.Trace], shaping: RewardShapingConfig, *, pass_turns: bool = True
+    ) -> list[float]:
+        """Each of a group's ``traces``' advantage: its shaped reward, less any length penalty, minus the baseline.
+        ``pass_turns=False`` leaves the turn penalty out."""
+        import torch  # only the trainer-side extras ship torch; an eval process never scores a group
+
         rewards = torch.tensor([trace.reward for trace in traces], dtype=torch.float32)
-        shaped_rewards = torch.tensor([shape_reward(trace, shaping)[0] for trace in traces], dtype=torch.float32)
+        shaped = shape_rewards(traces, shaping, pass_turns=pass_turns)
+        shaped_rewards = torch.tensor([reward for reward, _ in shaped], dtype=torch.float32)
         length_penalty = self.length_penalty
         if length_penalty is not None:
             subagent_weight = (
@@ -142,14 +184,23 @@ class GRPOAlgorithm(Algorithm):
                 dtype=rewards.dtype,
             )
             baseline = (lengths * shaped_rewards).sum() / lengths.sum()
-        advantages = shaped_rewards - baseline
-        for trace, advantage in zip(traces, advantages.tolist(), strict=True):
+        return (shaped_rewards - baseline).tolist()
+
+    @contextmanager
+    def admission_view(self, episodes: list[vf.Episode]) -> Iterator[None]:
+        """With ``shaping.pass_turns.gate_on_raw``, the gates judge a scored group by its advantages without the turn
+        penalty, so that the penalty never decides whether a group trains; its own advantages are back after."""
+        traces = [trace for _, trace in iter_trainable_traces(episodes)]
+        shaping = self.shaping_for(episodes) if traces else None
+        if shaping is None or shaping.pass_turns.weight == 0 or not shaping.pass_turns.gate_on_raw:
+            yield
+            return
+        scored = [[node.advantages for node in trace.nodes] for trace in traces]
+        for trace, advantage in zip(traces, self.group_advantages(traces, shaping, pass_turns=False), strict=True):
             assign_advantages(trace, advantage)
-        nodes = [node for trace in traces for node in trainable_nodes(trace)]
-        if self.loss_aggregation == "prompt" and nodes:
-            # rl weight 1/T_q per token: each group's weights sum to 1, and the trainer divides the
-            # rl loss by the sum of rl weights, i.e. the number of groups.
-            weight = 1.0 / sum(int(np.count_nonzero(node.mask)) for node in nodes)
-            for node in nodes:
-                rl = np.where(np.asarray(node.mask, dtype=bool), weight, 0.0).astype(np.float32)
-                node.loss_weights = {**(node.loss_weights or {}), "rl": rl}
+        try:
+            yield
+        finally:
+            for trace, advantages in zip(traces, scored, strict=True):
+                for node, values in zip(trace.nodes, advantages, strict=True):
+                    node.advantages = values

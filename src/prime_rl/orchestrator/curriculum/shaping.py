@@ -1,9 +1,10 @@
 """Live reward shaping: GRPO's ``shaping`` changed during a run, from a coming dispatch step on.
 
-``POST /v1/shaping`` names a step (or ``"next"``) and the fields of ``stuck`` and ``unfinished`` to change. A change
-is sticky: every group dispatched at that step or later trains under it, until a later change. A group is shaped by
-the step it was dispatched at, not when it is scored, so the groups in flight when a change is posted keep the
-setting they were dispatched under; a change for a step whose dispatch has started is refused, as a plan is.
+``POST /v1/shaping`` names a step (or ``"next"``) and the fields of ``stuck``, ``unfinished`` and ``pass_turns`` to
+change. A change is sticky: every group dispatched at that step or later trains under it, until a later change. A
+group is shaped by the step it was dispatched at, not when it is scored, so the groups in flight when a change is
+posted keep the setting they were dispatched under; a change for a step whose dispatch has started is refused, as a
+plan is.
 
 Each change is recorded in ``shaping.jsonl`` beside the plans, and each group's setting in ``groups.jsonl``. A
 resume reads the changes back; ``curriculum_plans.replay_from`` replays the changes recorded beside the dispatch
@@ -23,7 +24,8 @@ import verifiers.v1 as vf
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from prime_rl.configs.algorithm import RewardShapingConfig
-from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm, shape_reward
+from prime_rl.orchestrator.algo.base import iter_trainable_traces
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm, shape_rewards
 from prime_rl.orchestrator.curriculum.plans import PlanConflictError, PlanError, _append, _read_jsonl
 from prime_rl.orchestrator.utils import episode_env_name, train_work
 from prime_rl.utils.logger import get_logger
@@ -52,6 +54,17 @@ class UnfinishedChange(BaseModel):
     """``null`` keeps the env's scores again."""
 
 
+class PassTurnsChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    weight: float | None = None
+    """0 turns the penalty off."""
+    gate_on_raw: bool | None = None
+
+
+LEVERS = ("stuck", "unfinished", "pass_turns")
+
+
 class ShapingRequest(BaseModel):
     """The fields of the config's ``shaping`` to change from ``step`` on; what it leaves out keeps its setting."""
 
@@ -60,13 +73,14 @@ class ShapingRequest(BaseModel):
     step: ShapingStep
     stuck: StuckChange | None = None
     unfinished: UnfinishedChange | None = None
+    pass_turns: PassTurnsChange | None = None
     author: str | None = None
     note: str | None = None
     """Why the change was posted, kept with it in ``shaping.jsonl``."""
 
     def change(self) -> dict[str, dict[str, Any]]:
         """The fields the request sets, by lever."""
-        fields = self.model_dump(include={"stuck", "unfinished"}, exclude_unset=True)
+        fields = self.model_dump(include=set(LEVERS), exclude_unset=True)
         return {lever: values for lever, values in fields.items() if values}
 
 
@@ -133,7 +147,7 @@ class Shaping:
         """Store a change from ``request.step``, ``"next"`` taking the first step whose dispatch hasn't started."""
         change = request.change()
         if not change:
-            raise PlanError("A shaping change sets a field of 'stuck' or 'unfinished'")
+            raise PlanError("A shaping change sets a field of 'stuck', 'unfinished' or 'pass_turns'")
         if not self.defaults:
             raise PlanError("No train env runs GRPO, so there is no reward to shape")
         with self.plans.lock:
@@ -179,21 +193,19 @@ class Shaping:
 
     def record(self, group: list[vf.Episode]) -> dict[str, Any]:
         """A finalized group's shaping for its ``groups.jsonl`` line: the setting it trained under, and how many of
-        its rollouts each lever changed. Nothing for an env that doesn't run GRPO."""
+        its rollouts each lever changed, over the rollouts the group's scoring takes (every one of a down-sampled
+        group). Nothing for an env that doesn't run GRPO."""
         env = episode_env_name(group[0])
         if env not in self.defaults:
             return {}
         shaping = self.at(env, train_work(group[0]).step)
-        levers = [
-            shape_reward(trace, shaping)[1]
-            for episode in group
-            for trace in episode.traces
-            if episode.ok and not trace.has_error and trace.agent.trainable and trace.num_turns > 0
-        ]
+        traces = [trace for _, trace in iter_trainable_traces(group)]
+        levers = [changed for _, changed in shape_rewards(traces, shaping)]
         return {
             "shaping": shaping.model_dump(mode="json"),
-            "stuck_penalized": levers.count("stuck"),
-            "unfinished_scored": levers.count("unfinished"),
+            "stuck_penalized": sum("stuck" in changed for changed in levers),
+            "unfinished_scored": sum("unfinished" in changed for changed in levers),
+            "pass_turns_penalized": sum("pass_turns" in changed for changed in levers),
         }
 
     # ── internals ──────────────────────────────────────────────────────────

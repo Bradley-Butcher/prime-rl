@@ -131,14 +131,43 @@ class UnfinishedRewardConfig(BaseConfig):
     env's score for a cut-off rollout and 0 for a timed-out one."""
 
 
+class PassTurnsPenaltyConfig(BaseConfig):
+    """A cut in a pass's reward for its turns, relative to the other passes of its group. A pass is a rollout whose
+    env reward is positive and that the ``unfinished`` lever leaves to the env's score; with ``t`` its model turns
+    (``Trace.num_turns``, every sampled reply across the conversation) and ``t_min``, ``t_max`` the fewest and most of
+    the group's passes, its reward is multiplied by ``1 - weight * (t - t_min) / (t_max - t_min)``: the quickest pass
+    keeps its reward, the slowest keeps ``1 - weight``. A group with fewer than two passes, or whose passes took as
+    many turns, is unchanged, and a failure is never changed, so there is nothing for a failure to gain. The group is
+    the one the baseline is taken over: a down-sampled group's every rollout under ``baseline = "all"``, its kept
+    rollouts under ``"kept"``. Off while ``weight`` is 0."""
+
+    weight: float = Field(0.0, ge=0, lt=1, allow_inf_nan=False)
+    """The share of its reward the group's slowest pass loses. 0 turns the penalty off. Below 1, so every pass keeps a
+    positive reward and still beats every failure."""
+
+    gate_on_raw: bool = True
+    """The admission gates judge a group by its advantages without this penalty, so it never decides whether a group
+    trains: a group of passes that differ only in turns stays uniform to the zero-advantage gate and is still rejected,
+    and the penalty only orders the passes of a group the gates admit anyway. False shows the gates the penalized
+    advantages, so such a group becomes mixed and trains on its turns alone."""
+
+    def factor(self, turns: int, fewest: int, most: int) -> float:
+        """What a pass's reward is multiplied by for ``turns``, its group's passes taking ``fewest`` to ``most``."""
+        if most <= fewest:
+            return 1.0
+        return 1.0 - self.weight * (turns - fewest) / (most - fewest)
+
+
 class RewardShapingConfig(BaseConfig):
     """Reward shaping GRPO applies before its baseline, which ``POST /v1/shaping`` on the orchestrator's control API
     changes during a run from a coming dispatch step (see the training docs). Only the advantages see it: the trace's
     rewards, the difficulty-pool sampler, the curriculum stats and eval keep the env's scores. An unfinished rollout
-    takes ``unfinished.reward`` when it is set; any other rollout's positive reward is cut for its stuck calls."""
+    takes ``unfinished.reward`` when it is set; any other rollout's positive reward is cut for its stuck calls and,
+    relative to its group's other passes, for its turns; the two cuts multiply."""
 
     stuck: StuckPenaltyConfig = StuckPenaltyConfig()
     unfinished: UnfinishedRewardConfig = UnfinishedRewardConfig()
+    pass_turns: PassTurnsPenaltyConfig = PassTurnsPenaltyConfig()
 
 
 class EchoRoleConfig(BaseConfig):
@@ -258,7 +287,7 @@ class GRPOAlgoConfig(BaseAlgoConfig):
         return value
 
     shaping: RewardShapingConfig = RewardShapingConfig()
-    """Reward shaping before the baseline, changeable during a run: a stuck-call penalty on passes and a fixed reward for unfinished rollouts, both off by default (see ``RewardShapingConfig``). A length penalty applies on top."""
+    """Reward shaping before the baseline, changeable during a run: a stuck-call penalty on passes, a fixed reward for unfinished rollouts and a penalty on passes for their turns relative to their group's other passes, all off by default (see ``RewardShapingConfig``). A length penalty applies on top."""
 
     length_weighted_baseline: bool = False
     """Use the token-length-weighted group mean reward ``sum_i(L_i * r_i) / sum_i(L_i)`` as the baseline instead of the plain mean, where ``L_i`` is the number of trainable (mask-True, policy-sampled) tokens of rollout ``i`` summed across all its turns."""
