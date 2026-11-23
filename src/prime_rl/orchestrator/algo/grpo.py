@@ -17,14 +17,15 @@ if TYPE_CHECKING:
 
 
 def shape_rewards(
-    traces: Sequence[vf.Trace], shaping: RewardShapingConfig, *, pass_turns: bool = True
+    traces: Sequence[vf.Trace], shaping: RewardShapingConfig, *, pass_penalty: bool = True
 ) -> list[tuple[float, tuple[str, ...]]]:
     """The reward GRPO's baseline and advantages take for each of a group's ``traces`` under ``shaping``, and the
-    levers that changed it, of ``"unfinished"``, ``"stuck"`` and ``"pass_turns"``.
+    levers that changed it, of ``"unfinished"``, ``"stuck"``, ``"pass_turns"`` and ``"pass_cost"``.
 
     An unfinished rollout takes ``unfinished.reward`` when it is set. Every other rollout with a positive reward is a
     pass: its reward is cut for its stuck calls (a trace without the stuck metric is not cut) and then, unless
-    ``pass_turns`` is False, for its turns relative to the group's other passes. A failure keeps its reward."""
+    ``pass_penalty`` is False, for its turns, or its turns and tokens, relative to the group's other passes. A failure
+    keeps its reward."""
     rewards: list[float] = []
     levers: list[tuple[str, ...]] = []
     passes: list[int] = []
@@ -42,15 +43,34 @@ def shape_rewards(
                 reward, changed = reward * factor, ("stuck",)
         rewards.append(reward)
         levers.append(changed)
-    if pass_turns and shaping.pass_turns.weight > 0 and len(passes) >= 2:
-        turns = [traces[index].num_turns for index in passes]
-        fewest, most = min(turns), max(turns)
-        for index, count in zip(passes, turns, strict=True):
-            factor = shaping.pass_turns.factor(count, fewest, most)
-            if factor < 1:
-                rewards[index] *= factor
-                levers[index] += ("pass_turns",)
+    if pass_penalty and len(passes) >= 2:
+        if shaping.pass_turns.weight > 0:
+            turns = [traces[index].num_turns for index in passes]
+            factors = [shaping.pass_turns.factor(count, min(turns), max(turns)) for count in turns]
+            _cut(rewards, levers, passes, factors, "pass_turns")
+        if shaping.pass_cost.weight > 0:
+            costs = [
+                shaping.pass_cost.cost(traces[index].num_turns, generated_tokens(traces[index])) for index in passes
+            ]
+            _cut(rewards, levers, passes, shaping.pass_cost.factors(costs, len(traces)), "pass_cost")
     return list(zip(rewards, levers, strict=True))
+
+
+def generated_tokens(trace: vf.Trace) -> int:
+    """The tokens the policy generated over the rollout, each model call counted once. ``Trace.num_output_tokens`` sums
+    over the trace's branches, so it counts the calls that branches share once for each of them."""
+    usage = trace.usage
+    return usage.completion_tokens if usage is not None else 0
+
+
+def _cut(
+    rewards: list[float], levers: list[tuple[str, ...]], passes: list[int], factors: list[float], lever: str
+) -> None:
+    """Multiply each of ``passes``' rewards by its factor, and name ``lever`` where that changed it."""
+    for index, factor in zip(passes, factors, strict=True):
+        if factor < 1:
+            rewards[index] *= factor
+            levers[index] += (lever,)
 
 
 class GRPOAlgorithm(Algorithm):
@@ -95,14 +115,14 @@ class GRPOAlgorithm(Algorithm):
                 node.loss_weights = {**(node.loss_weights or {}), "rl": [weight if m else 0.0 for m in node.mask]}
 
     def group_advantages(
-        self, traces: list[vf.Trace], shaping: RewardShapingConfig, *, pass_turns: bool = True
+        self, traces: list[vf.Trace], shaping: RewardShapingConfig, *, pass_penalty: bool = True
     ) -> list[float]:
         """Each of a group's ``traces``' advantage: its shaped reward, less any length penalty, minus the baseline.
-        ``pass_turns=False`` leaves the turn penalty out."""
+        ``pass_penalty=False`` leaves the pass penalty out."""
         import torch  # only the trainer-side extras ship torch; an eval process never scores a group
 
         rewards = torch.tensor([trace.reward for trace in traces], dtype=torch.float32)
-        shaped = shape_rewards(traces, shaping, pass_turns=pass_turns)
+        shaped = shape_rewards(traces, shaping, pass_penalty=pass_penalty)
         shaped_rewards = torch.tensor([reward for reward, _ in shaped], dtype=torch.float32)
         length_penalty = self.length_penalty
         if length_penalty is not None:
@@ -127,15 +147,17 @@ class GRPOAlgorithm(Algorithm):
 
     @contextmanager
     def admission_view(self, episodes: list[vf.Episode]) -> Iterator[None]:
-        """With ``shaping.pass_turns.gate_on_raw``, the gates judge a scored group by its advantages without the turn
-        penalty, so that the penalty never decides whether a group trains; its own advantages are back after."""
+        """With the pass penalty's ``gate_on_raw`` (``shaping.pass_turns`` or ``shaping.pass_cost``), the gates judge a
+        scored group by its advantages without the penalty, so that the penalty never decides whether a group trains;
+        its own advantages are back after."""
         traces = [trace for _, trace in iter_trainable_traces(episodes)]
         shaping = self.shaping_for(episodes) if traces else None
-        if shaping is None or shaping.pass_turns.weight == 0 or not shaping.pass_turns.gate_on_raw:
+        penalty = shaping.pass_penalty if shaping is not None else None
+        if penalty is None or not penalty.gate_on_raw:
             yield
             return
         scored = [[node.advantages for node in trace.nodes] for trace in traces]
-        for trace, advantage in zip(traces, self.group_advantages(traces, shaping, pass_turns=False), strict=True):
+        for trace, advantage in zip(traces, self.group_advantages(traces, shaping, pass_penalty=False), strict=True):
             assign_advantages(trace, advantage)
         try:
             yield

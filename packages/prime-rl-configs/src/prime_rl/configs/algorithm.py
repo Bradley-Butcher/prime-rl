@@ -34,6 +34,8 @@ count; per-token component weights ship on the wire and the trainer just
 executes them.
 """
 
+import math
+from collections.abc import Sequence
 from typing import Annotated, Any, ClassVar, Literal, TypeAlias
 
 import verifiers.v1 as vf
@@ -160,16 +162,79 @@ class PassTurnsPenaltyConfig(BaseConfig):
         return 1.0 - self.weight * (turns - fewest) / (most - fewest)
 
 
+class PassCostPenaltyConfig(BaseConfig):
+    """A cut in a pass's reward for its cost, in turns and generated tokens, relative to the other passes of its group.
+    A pass is as ``PassTurnsPenaltyConfig``'s. Its cost is its model turns plus, with ``tokens_per_turn`` set, the
+    tokens it generated (reasoning, text and tool calls; tool results are not counted) over ``tokens_per_turn``. With
+    ``ref`` the ``reference`` quantile of the passes' costs and ``p`` the share of the group's rollouts that are passes,
+    a pass's reward is multiplied by ``1 - min(cap, weight * p * max(0, ln(cost / ref)))``: passes up to ``ref`` keep
+    their reward, costing twice as much takes as much off a short Task's pass as off a long one's, and a Task the policy
+    seldom passes is cut little. A group with fewer than two passes is unchanged and a failure is never changed. The
+    group is the one the baseline is taken over, as for ``pass_turns``, which can't be on at the same time. Off while
+    ``weight`` is 0."""
+
+    weight: float = Field(0.0, ge=0, allow_inf_nan=False)
+    """The share of its reward a pass loses, in a group of only passes, for each e-fold its cost is above ``ref``: at
+    0.3, twice ``ref`` loses 0.21. 0 turns the penalty off."""
+
+    cap: float = Field(0.3, ge=0, lt=1, allow_inf_nan=False)
+    """The most of its reward a pass loses. Below 1, so every pass keeps a positive reward and still beats every
+    failure."""
+
+    tokens_per_turn: float | None = Field(None, gt=0, allow_inf_nan=False)
+    """The generated tokens that cost as much as one turn. None counts turns only."""
+
+    reference: float = Field(0.25, ge=0, le=1, allow_inf_nan=False)
+    """The quantile of the passes' costs, linearly interpolated, at and below which a pass keeps its reward: 0 is the
+    cheapest pass."""
+
+    gate_on_raw: bool = True
+    """As ``PassTurnsPenaltyConfig.gate_on_raw``: the admission gates judge a group by its advantages without this
+    penalty. False shows the gates the penalized advantages, so a group of passes that differ in cost can train on that
+    alone; an ``advantage_range`` gate's bounds then say by how much they must differ."""
+
+    def cost(self, turns: int, output_tokens: int) -> float:
+        """A rollout's cost in turns."""
+        return turns + (output_tokens / self.tokens_per_turn if self.tokens_per_turn is not None else 0.0)
+
+    def factors(self, costs: Sequence[float], rollouts: int) -> list[float]:
+        """What each pass's reward is multiplied by, for the ``costs`` of the passes of a group of ``rollouts``."""
+        if self.weight == 0 or len(costs) < 2:
+            return [1.0] * len(costs)
+        ordered = sorted(costs)
+        position = self.reference * (len(ordered) - 1)
+        below = math.floor(position)
+        above = min(below + 1, len(ordered) - 1)
+        ref = ordered[below] + (position - below) * (ordered[above] - ordered[below])
+        scale = self.weight * len(costs) / rollouts
+        return [1.0 - min(self.cap, scale * max(0.0, math.log(cost / ref))) for cost in costs]
+
+
 class RewardShapingConfig(BaseConfig):
     """Reward shaping GRPO applies before its baseline, which ``POST /v1/shaping`` on the orchestrator's control API
     changes during a run from a coming dispatch step (see the training docs). Only the advantages see it: the trace's
     rewards, the difficulty-pool sampler, the curriculum stats and eval keep the env's scores. An unfinished rollout
     takes ``unfinished.reward`` when it is set; any other rollout's positive reward is cut for its stuck calls and,
-    relative to its group's other passes, for its turns; the two cuts multiply."""
+    relative to its group's other passes, for its turns (``pass_turns``) or its turns and tokens (``pass_cost``); the
+    cuts multiply."""
 
     stuck: StuckPenaltyConfig = StuckPenaltyConfig()
     unfinished: UnfinishedRewardConfig = UnfinishedRewardConfig()
     pass_turns: PassTurnsPenaltyConfig = PassTurnsPenaltyConfig()
+    pass_cost: PassCostPenaltyConfig = PassCostPenaltyConfig()
+
+    @model_validator(mode="after")
+    def validate_one_pass_penalty(self):
+        if self.pass_turns.weight > 0 and self.pass_cost.weight > 0:
+            raise ValueError(
+                "shaping.pass_turns and shaping.pass_cost both cut a pass for its turns; set one's weight to 0"
+            )
+        return self
+
+    @property
+    def pass_penalty(self) -> PassTurnsPenaltyConfig | PassCostPenaltyConfig | None:
+        """The pass penalty that is on, if one is."""
+        return next((lever for lever in (self.pass_turns, self.pass_cost) if lever.weight > 0), None)
 
 
 class EchoRoleConfig(BaseConfig):

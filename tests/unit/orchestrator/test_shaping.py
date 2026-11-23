@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from prime_rl.configs.algorithm import (
     GRPOAlgoConfig,
+    PassCostPenaltyConfig,
     PassTurnsPenaltyConfig,
     RewardShapingConfig,
     StuckPenaltyConfig,
@@ -16,7 +18,7 @@ from prime_rl.configs.orchestrator import AdvRangeGateConfig, CurriculumConfig, 
 from prime_rl.control.app import create_app
 from prime_rl.control.controller import Controller
 from prime_rl.control.plans import plan_router
-from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm, shape_rewards
+from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm, generated_tokens, shape_rewards
 from prime_rl.orchestrator.curriculum.gates import AdvRangeGate
 from prime_rl.orchestrator.curriculum.plans import PlanConflictError, Plans
 from prime_rl.orchestrator.curriculum.shaping import Shaping, ShapingRequest
@@ -29,17 +31,26 @@ DEFAULT = RewardShapingConfig().model_dump(mode="json")
 
 
 def rollout(
-    reward: float, *, stuck: int = 0, stop: str | None = None, step: int = 1, group: str = "g", turns: int = 1
+    reward: float,
+    *,
+    stuck: int = 0,
+    stop: str | None = None,
+    step: int = 1,
+    group: str = "g",
+    turns: int = 1,
+    tokens: int = 2,
 ) -> vf.Episode:
     """One train rollout of env ``a``, dispatched at ``step``, with ``stuck`` stuck calls and ``turns`` replies, each
-    after a user message."""
+    after a user message and reported as ``tokens`` generated tokens."""
     task = vf.TraceTask(type="Task", data=vf.TaskData(idx=0, prompt=None), key="t0")
     nodes, calls = [], []
     for _ in range(turns):
         parent = len(nodes) - 1 if nodes else None
         nodes.append(vf.MessageNode(parent=parent, message=vf.UserMessage(content="q"), token_ids=[1], mask=[False]))
         calls.append(
-            vf.ModelCall(node=len(nodes), usage=vf.Usage(prompt_tokens=1, completion_tokens=2), finish_reason="stop")
+            vf.ModelCall(
+                node=len(nodes), usage=vf.Usage(prompt_tokens=1, completion_tokens=tokens), finish_reason="stop"
+            )
         )
         nodes.append(
             vf.MessageNode(
@@ -506,3 +517,224 @@ def test_a_resume_and_a_replay_read_the_turn_penalty_back(tmp_path):
     assert advantages(resumed_algorithm, turns_group(step=4)) == pytest.approx(PENALIZED)
     assert advantages(resumed_algorithm, turns_group(step=5)) == pytest.approx(UNPENALIZED)
     assert advantages(replayed_algorithm, turns_group(step=2)) == pytest.approx(PENALIZED)
+
+
+COST_ON = {"pass_cost": {"weight": 0.3, "reference": 0.0}}
+COST_DEFAULT = PassCostPenaltyConfig().model_dump(mode="json")
+
+
+def test_the_cost_penalty_cuts_a_pass_by_how_many_times_dearer_it_was_and_never_a_failure():
+    group = [rollout(1.0, turns=4), rollout(1.0, turns=8), rollout(1.0, turns=32), rollout(0.0, turns=1)]
+
+    # 3 of 4 pass, so the weight is 0.3 * 0.75; the dearest pass, 8 times the cheapest, stops at the cap of 0.3. The
+    # failure, cheaper than any pass, stays 0 and sets no reference.
+    assert shaped(COST_ON, group) == [
+        (1.0, ()),
+        (pytest.approx(1 - 0.225 * math.log(2)), ("pass_cost",)),
+        (pytest.approx(0.7), ("pass_cost",)),
+        (0.0, ()),
+    ]
+    assert RewardShapingConfig().pass_cost.weight == 0.0  # off by default
+    assert RewardShapingConfig().pass_penalty is None
+
+
+def test_the_cost_penalty_prices_generated_tokens_in_turns():
+    # 4 turns of 250 tokens and 8 of 50 cost 4 + 1 and 8 + 0.4 at 1,000 tokens a turn, and 4 + 10 and 8 + 4 at 100.
+    group = [rollout(1.0, turns=4, tokens=250), rollout(1.0, turns=8, tokens=50)]
+
+    def cut(tokens_per_turn):
+        shaping = {"pass_cost": {"weight": 0.3, "reference": 0.0, "tokens_per_turn": tokens_per_turn}}
+        return [reward for reward, _ in shaped(shaping, group)]
+
+    assert cut(None) == pytest.approx([1.0, 1 - 0.3 * math.log(2)])
+    assert cut(1000) == pytest.approx([1.0, 1 - 0.3 * math.log(8.4 / 5)])
+    assert cut(100) == pytest.approx([1 - 0.3 * math.log(14 / 12), 1.0])
+
+
+def test_generated_tokens_counts_a_call_once_though_branches_share_it():
+    trace = rollout(1.0, turns=2, tokens=5).traces[0]
+    # A second reply to the first user message: the trace now has two branches, sharing the first user message only.
+    trace.nodes.append(
+        vf.MessageNode(
+            parent=1,
+            message=vf.UserMessage(content="other"),
+            token_ids=[1],
+            mask=[False],
+        )
+    )
+    trace.calls.append(
+        vf.ModelCall(node=len(trace.nodes), usage=vf.Usage(prompt_tokens=1, completion_tokens=7), finish_reason="stop")
+    )
+    trace.nodes.append(
+        vf.MessageNode(
+            parent=len(trace.nodes) - 1,
+            message=vf.AssistantMessage(content="b"),
+            token_ids=[2, 3],
+            mask=[True, True],
+            logprobs=[-0.1, -0.1],
+            sampled=True,
+        )
+    )
+
+    assert trace.num_branches == 2
+    assert generated_tokens(trace) == 5 + 5 + 7
+    assert trace.num_output_tokens == 5 + 5 + 5 + 7  # the first reply once for each branch
+
+
+@pytest.mark.parametrize(
+    "reference, ref",
+    [(0.0, 4), (0.25, 5.5), (0.5, 7.0), (1.0, 20)],
+)
+def test_the_reference_is_a_quantile_of_the_passes_costs(reference, ref):
+    costs = [8.0, 4.0, 20.0, 6.0]
+    factors = PassCostPenaltyConfig(weight=0.1, reference=reference).factors(costs, rollouts=4)
+
+    assert factors == pytest.approx([1 - 0.1 * max(0.0, math.log(cost / ref)) for cost in costs])
+
+
+def test_the_cost_penalty_cuts_a_task_the_policy_seldom_passes_by_less():
+    penalty = PassCostPenaltyConfig(weight=0.3, reference=0.0)
+
+    assert penalty.factors([4, 8], rollouts=2) == pytest.approx([1, 1 - 0.3 * math.log(2)])
+    assert penalty.factors([4, 8], rollouts=12) == pytest.approx([1, 1 - 0.05 * math.log(2)])
+
+
+@pytest.mark.parametrize(
+    "shaping, rewards, turns",
+    [
+        (COST_ON, [1.0, 0.0, 0.0], [3, 1, 9]),
+        (COST_ON, [1.0, 1.0, 0.0], [5, 5, 2]),
+        (COST_ON, [0.0, 0.0], [5, 9]),
+        ({"pass_cost": {"weight": 0.0}}, [1.0, 1.0], [2, 8]),
+    ],
+    ids=["one pass", "passes of equal cost", "no pass", "off"],
+)
+def test_one_pass_or_passes_of_equal_cost_are_unchanged(shaping, rewards, turns):
+    group = [rollout(reward, turns=count) for reward, count in zip(rewards, turns)]
+
+    assert shaped(shaping, group) == [(reward, ()) for reward in rewards]
+
+
+def test_the_cost_penalty_multiplies_the_stuck_one_and_leaves_unfinished_rollouts_to_their_lever():
+    shaping = {"stuck": {"per_call": 0.05}, "unfinished": {"reward": -0.25}, **COST_ON}
+    group = [
+        rollout(1.0, turns=2),
+        rollout(1.0, turns=4, stuck=4),
+        rollout(1.0, turns=30, stop="max_turns"),  # the turn cap cut it off; the env passed it
+        rollout(0.0, turns=1),
+    ]
+
+    # The unfinished lever takes the cut-off pass, so 2 of 4 pass; the stuck cut is 0.9.
+    assert shaped(shaping, group) == [
+        (1.0, ()),
+        (pytest.approx(0.9 * (1 - 0.15 * math.log(2))), ("stuck", "pass_cost")),
+        (-0.25, ("unfinished",)),
+        (0.0, ()),
+    ]
+
+
+@pytest.mark.parametrize("gate_on_raw", [True, False])
+def test_by_default_the_gate_judges_a_group_without_the_cost_penalty(gate_on_raw):
+    shaping = {"pass_cost": {"weight": 0.3, "reference": 0.0, "gate_on_raw": gate_on_raw}}
+    algorithm = GRPOAlgorithm(GRPOAlgoConfig(shaping=shaping), None)
+    groups = {
+        "passes that differ in cost": [rollout(1.0, turns=turns, group="p") for turns in (2, 4)],
+        "a pass and a failure": [rollout(reward, turns=3, group="m") for reward in (1.0, 0.0)],
+    }
+
+    sink, trained = gated(algorithm, groups)
+
+    assert trained == ({"a pass and a failure"} if gate_on_raw else set(groups))
+    half = 0.15 * math.log(2)
+    scored = {"passes that differ in cost": [half, -half], "a pass and a failure": [0.5, -0.5]}
+    for name, group in groups.items():
+        assert [episode.traces[0].nodes[1].advantages[0] for episode in group] == pytest.approx(scored[name])
+
+
+def test_a_wider_gate_trains_only_passes_that_differ_enough():
+    gate = AdvRangeGate(AdvRangeGateConfig(reject_min=-0.15, reject_max=0.15))
+    algorithm = GRPOAlgorithm(GRPOAlgoConfig(shaping={"pass_cost": {**COST_ON["pass_cost"], "cap": 0.9}}), None)
+
+    def admitted(rewards, turns):
+        group = [rollout(reward, turns=count) for reward, count in zip(rewards, turns)]
+        advantages(algorithm, group)
+        return gate.admit(group)
+
+    assert not admitted([1.0, 1.0], [8, 9])  # within 0.02 of their mean
+    assert admitted([1.0, 1.0], [4, 12])  # 0.16 from it
+    assert admitted([1.0, 0.0], [8, 9])
+
+
+def test_only_one_pass_penalty_can_be_on():
+    both = {"pass_turns": {"weight": 0.1}, "pass_cost": {"weight": 0.3}}
+    with pytest.raises(ValueError, match="set one's weight to 0"):
+        RewardShapingConfig.model_validate(both)
+    for bad in ({"weight": -0.1}, {"cap": 1.0}, {"tokens_per_turn": 0}, {"reference": 1.1}):
+        with pytest.raises(ValueError):
+            PassCostPenaltyConfig(**bad)
+
+
+def test_the_cost_penalty_is_set_live_replacing_the_turn_penalty_in_one_change(tmp_path):
+    source, algorithm, shaping = live(tmp_path)
+    client = TestClient(create_app(Controller(requires_step=True), [plan_router(source.plans, shaping=shaping)]))
+    source.next_task(step=1)
+    assert client.post("/v1/shaping", json={"step": "next", **TURNS_ON}).status_code == 200
+    source.next_task(step=2)
+
+    # With the turn penalty on from step 2, the cost penalty alone is refused; both in one change swaps them.
+    assert client.post("/v1/shaping", json={"step": 3, "pass_cost": {"weight": 0.3}}).status_code == 422
+    for bad in ({"weight": -1}, {"cap": 1}, {"tokens_per_turn": 0}, {"reference": 2}, {"bogus": 1}, {}):
+        change = {"step": 3, "pass_turns": {"weight": 0}, "pass_cost": bad}
+        if bad:
+            assert client.post("/v1/shaping", json=change).status_code == 422, bad
+    swap = {"pass_turns": {"weight": 0}, "pass_cost": {"weight": 0.3, "reference": 0.0, "tokens_per_turn": 100}}
+    assert client.post("/v1/shaping", json={"step": 3, **swap}).status_code == 200
+    source.next_task(step=3)
+    assert client.post("/v1/shaping", json={"step": 4, "pass_cost": {"tokens_per_turn": None}}).status_code == 200
+    source.next_task(step=4)
+
+    def group(step, name):
+        return [rollout(1.0, turns=turns, tokens=50, step=step, group=name) for turns in (2, 4)]
+
+    # Two turns of 50 tokens cost 3 and four cost 6; from step 4, 2 and 4. Both are twice the cheaper.
+    half = 0.15 * math.log(2)
+    assert advantages(algorithm, group(2, "at-2")) == pytest.approx([0.1, -0.1])
+    assert advantages(algorithm, group(3, "at-3")) == pytest.approx([half, -half])
+    assert shaping.at("a", 3).pass_cost.tokens_per_turn == 100
+    assert shaping.at("a", 4).pass_cost.tokens_per_turn is None
+
+    source.on_result(group(2, "at-2"))
+    source.on_result(group(3, "at-3"))
+    recorded = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
+    assert [(line["pass_turns_penalized"], line["pass_cost_penalized"]) for line in recorded] == [(1, 0), (0, 1)]
+    on = {**COST_DEFAULT, "weight": 0.3, "reference": 0.0, "tokens_per_turn": 100.0}
+    assert [line["shaping"]["pass_cost"] for line in recorded] == [COST_DEFAULT, on]
+
+    _, _, resumed = live(tmp_path, resume_step=4)
+    assert [resumed.at("a", step) for step in range(1, 6)] == [shaping.at("a", step) for step in range(1, 6)]
+
+
+@pytest.mark.parametrize("baseline", ["all", "kept"])
+def test_the_cost_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tmp_path, baseline):
+    sink, source = downsampled(tmp_path, baseline)
+    swap = {"pass_turns": {"weight": 0.0}, "pass_cost": {"weight": 0.2, "reference": 0.0, "cap": 0.9}}
+    post(source.plans.shaping, "next", **swap)
+    group = [rollout(1.0, turns=turns, group="mixed") for turns in (2, 4, 6, 8, 10, 12)]
+    group += [rollout(0.0, turns=turns, group="mixed") for turns in (1, 3, 5, 7, 9, 11)]
+
+    for episode in group:
+        asyncio.run(sink.add(episode))
+
+    traces = {episode.traces[0].id: episode.traces[0] for episode in group}
+    kept = [traces[trace_id] for trace_id in sink.pending_batch]
+    scored = kept if baseline == "kept" else [episode.traces[0] for episode in group]
+    cheapest = min(trace.num_turns for trace in scored if trace.reward)
+    share = sum(1 for trace in scored if trace.reward) / len(scored)
+    rewards = {
+        trace.id: 1 - 0.2 * share * math.log(trace.num_turns / cheapest) if trace.reward else 0.0 for trace in scored
+    }
+    mean = sum(rewards.values()) / len(scored)
+    for trace_id, samples in sink.pending_batch.items():
+        assert [trained_advantage(sample) for sample in samples] == pytest.approx(
+            [rewards[trace_id] - mean] * len(samples)
+        )

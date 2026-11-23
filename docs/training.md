@@ -391,7 +391,7 @@ To rerun a recorded run's Task schedule, set `--orchestrator.curriculum-plans.re
 
 ### Shaping a Live Run's Reward
 
-With `--orchestrator.control`, the orchestrator's API also changes GRPO's reward shaping (`algo.shaping`, see [Algorithms](algorithms.md)) from a coming dispatch step: `stuck`, the cut in a pass's reward for its stuck calls, `unfinished`, the reward of a cut-off or timed-out rollout, and `pass_turns`, the cut in a pass's reward for its turns relative to its group's other passes. A change names the fields it sets, which every GRPO env takes on top of its config; a field it leaves out keeps its setting. A change is sticky: it applies to every group dispatched at its step or later, until a later change. A group is shaped by the step it was dispatched at, not when it is scored, so groups in flight keep the setting they were dispatched under. A change for a step whose dispatch has started is refused with 409, as a plan is; `"step": "next"` takes the first open step.
+With `--orchestrator.control`, the orchestrator's API also changes GRPO's reward shaping (`algo.shaping`, see [Algorithms](algorithms.md)) from a coming dispatch step: `stuck`, the cut in a pass's reward for its stuck calls, `unfinished`, the reward of a cut-off or timed-out rollout, `pass_turns`, the cut in a pass's reward for its turns relative to its group's other passes, and `pass_cost`, the cut for its turns and generated tokens together. `pass_turns` and `pass_cost` can't both be on, so a change from one to the other sets both in one request. A change names the fields it sets, which every GRPO env takes on top of its config; a field it leaves out keeps its setting. A change is sticky: it applies to every group dispatched at its step or later, until a later change. A group is shaped by the step it was dispatched at, not when it is scored, so groups in flight keep the setting they were dispatched under. A change for a step whose dispatch has started is refused with 409, as a plan is; `"step": "next"` takes the first open step.
 
 ```bash
 curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
@@ -400,10 +400,12 @@ curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
   -d '{"step": "next", "author": "me", "note": "runaways", "unfinished": {"reward": -1}}'
 curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
   -d '{"step": "next", "author": "me", "note": "passes dawdle", "pass_turns": {"weight": 0.2}}'
+curl -X POST localhost:8041/v1/shaping -H 'content-type: application/json' \
+  -d '{"step": "next", "note": "price tokens too", "pass_turns": {"weight": 0}, "pass_cost": {"weight": 0.3, "tokens_per_turn": 1000}}'
 curl localhost:8041/v1/shaping          # the setting dispatching now, pending and past changes; /v1/status has the first two
 ```
 
-`{"unfinished": {"reward": null}}` gives cut-off and timed-out rollouts the env's scores again, `{"stuck": {"per_call": 0}}` turns the stuck penalty off and `{"pass_turns": {"weight": 0}}` the turn penalty. Each change is recorded in `curriculum/shaping.jsonl`, and each group's setting, with how many of its rollouts each lever changed (`stuck_penalized`, `unfinished_scored`, `pass_turns_penalized`, over every rollout of a down-sampled group), in its `groups.jsonl` line. A resume reads the changes back; a run with `curriculum-plans.replay-from` replays the changes recorded beside that `dispatch.jsonl` and refuses new ones.
+`{"unfinished": {"reward": null}}` gives cut-off and timed-out rollouts the env's scores again, `{"stuck": {"per_call": 0}}` turns the stuck penalty off and `{"pass_turns": {"weight": 0}}` or `{"pass_cost": {"weight": 0}}` the pass penalty. Each change is recorded in `curriculum/shaping.jsonl`, and each group's setting, with how many of its rollouts each lever changed (`stuck_penalized`, `unfinished_scored`, `pass_turns_penalized`, `pass_cost_penalized`, over every rollout of a down-sampled group), in its `groups.jsonl` line. A resume reads the changes back; a run with `curriculum-plans.replay-from` replays the changes recorded beside that `dispatch.jsonl` and refuses new ones.
 
 ### Exporting Checkpoints
 

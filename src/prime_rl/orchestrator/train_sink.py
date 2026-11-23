@@ -271,7 +271,7 @@ class TrainSink:
         # difficulty sampler and the curriculum records see the whole group with its pick.
         kept = self._downsample(env_name, env, survivors)
         # The gates judge the group's advantages, or what its algorithm shows them while they do (GRPO's
-        # shaping.pass_turns.gate_on_raw judges it without the turn penalty).
+        # shaping.pass_turns and pass_cost judge it without their cut under gate_on_raw).
         with env.algorithm.admission_view(group) if survivors else contextlib.nullcontext():
             admitted = self._admit(group, kept) if group else False
         left_out: set[str] = set()

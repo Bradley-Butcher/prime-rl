@@ -1,10 +1,10 @@
 """Live reward shaping: GRPO's ``shaping`` changed during a run, from a coming dispatch step on.
 
-``POST /v1/shaping`` names a step (or ``"next"``) and the fields of ``stuck``, ``unfinished`` and ``pass_turns`` to
-change. A change is sticky: every group dispatched at that step or later trains under it, until a later change. A
-group is shaped by the step it was dispatched at, not when it is scored, so the groups in flight when a change is
-posted keep the setting they were dispatched under; a change for a step whose dispatch has started is refused, as a
-plan is.
+``POST /v1/shaping`` names a step (or ``"next"``) and the fields of ``stuck``, ``unfinished``, ``pass_turns`` and
+``pass_cost`` to change. A change is sticky: every group dispatched at that step or later trains under it, until a
+later change. A group is shaped by the step it was dispatched at, not when it is scored, so the groups in flight when
+a change is posted keep the setting they were dispatched under; a change for a step whose dispatch has started is
+refused, as a plan is.
 
 Each change is recorded in ``shaping.jsonl`` beside the plans, and each group's setting in ``groups.jsonl``. A
 resume reads the changes back; ``curriculum_plans.replay_from`` replays the changes recorded beside the dispatch
@@ -62,7 +62,19 @@ class PassTurnsChange(BaseModel):
     gate_on_raw: bool | None = None
 
 
-LEVERS = ("stuck", "unfinished", "pass_turns")
+class PassCostChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    weight: float | None = None
+    """0 turns the penalty off."""
+    cap: float | None = None
+    tokens_per_turn: float | None = None
+    """``null`` counts turns only."""
+    reference: float | None = None
+    gate_on_raw: bool | None = None
+
+
+LEVERS = ("stuck", "unfinished", "pass_turns", "pass_cost")
 
 
 class ShapingRequest(BaseModel):
@@ -74,6 +86,7 @@ class ShapingRequest(BaseModel):
     stuck: StuckChange | None = None
     unfinished: UnfinishedChange | None = None
     pass_turns: PassTurnsChange | None = None
+    pass_cost: PassCostChange | None = None
     author: str | None = None
     note: str | None = None
     """Why the change was posted, kept with it in ``shaping.jsonl``."""
@@ -147,7 +160,7 @@ class Shaping:
         """Store a change from ``request.step``, ``"next"`` taking the first step whose dispatch hasn't started."""
         change = request.change()
         if not change:
-            raise PlanError("A shaping change sets a field of 'stuck', 'unfinished' or 'pass_turns'")
+            raise PlanError("A shaping change sets a field of 'stuck', 'unfinished', 'pass_turns' or 'pass_cost'")
         if not self.defaults:
             raise PlanError("No train env runs GRPO, so there is no reward to shape")
         with self.plans.lock:
@@ -206,6 +219,7 @@ class Shaping:
             "stuck_penalized": sum("stuck" in changed for changed in levers),
             "unfinished_scored": sum("unfinished" in changed for changed in levers),
             "pass_turns_penalized": sum("pass_turns" in changed for changed in levers),
+            "pass_cost_penalized": sum("pass_cost" in changed for changed in levers),
         }
 
     # ── internals ──────────────────────────────────────────────────────────
