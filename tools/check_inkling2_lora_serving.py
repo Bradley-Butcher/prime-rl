@@ -19,7 +19,12 @@ Trainer and server share the GPU unless ``--server-gpu`` names a second one. The
 one H200 takes both with ``--gpu-memory-utilization 0.45`` or so.
 
 A run passes when the diagonal is below ``--tolerance`` and everything else is well above it. Compare the diagonal's
-adapters with its base: an adapter adds no mismatch of its own.
+adapters with its base: an adapter adds no mismatch of its own. Each cell also gives prime-rl's ``mismatch_kl``, the mean
+of ``exp(r) - 1 - r`` over the tokens, ``r`` the trainer's logprob less the server's.
+
+The trainer computes attention with ``--attention-kernel`` (``auto``: the Triton kernels on a GPU). ``--also-kernel dense``
+computes the tables again with the other kernel, on the same adapters and samples, which shows what the kernels do to
+the mismatch without a second server.
 """
 
 import argparse
@@ -272,6 +277,7 @@ class Trainer:
             lora=self.lora,
             compile=None,
             ac=None,
+            inkling2_loop_attention=args.attention_kernel,
         )
         for name, value in (("RANK", 0), ("WORLD_SIZE", 1), ("LOCAL_RANK", 0), ("MASTER_PORT", args.port + 50)):
             os.environ.setdefault(name, str(value))
@@ -348,15 +354,25 @@ def moved_entries(before: list[Tensor], after: list[Tensor]) -> float:
     return changed / sum(param.numel() for param in before)
 
 
+def use_kernel(trainer: Trainer, kernel: str) -> None:
+    from prime_rl.trainer.models.inkling2_loop.attention import Inkling2Attention
+
+    layers = [module for module in trainer.model.modules() if isinstance(module, Inkling2Attention)]
+    assert layers, "no Inkling 2 attention layer to set the kernel of"
+    for layer in layers:
+        layer.kernel = kernel
+
+
 @torch.no_grad()
-def differences(trainer: Trainer, samples: list[Sample], replay: bool) -> tuple[float, float]:
-    """Mean and largest |trainer logprob - server logprob| of the sampled tokens."""
+def differences(trainer: Trainer, samples: list[Sample], replay: bool) -> tuple[float, float, float]:
+    """Mean and largest |trainer logprob - server logprob| of the sampled tokens, and their mean mismatch KL."""
     routed = [sample.routed_experts for sample in samples] if replay else None
     logprobs = trainer.forward([sample.token_ids for sample in samples], routed).float().cpu()
     ends = np.cumsum([len(sample.token_ids) for sample in samples])
     sampled = torch.cat([logprobs[end - len(sample.completion) : end] for end, sample in zip(ends, samples)])
-    delta = (sampled - torch.cat([sample.logprobs for sample in samples])).abs()
-    return delta.mean().item(), delta.max().item()
+    log_ratio = sampled - torch.cat([sample.logprobs for sample in samples])
+    delta = log_ratio.abs()
+    return delta.mean().item(), delta.max().item(), (torch.expm1(log_ratio) - log_ratio).mean().item()
 
 
 def main() -> None:
@@ -376,6 +392,8 @@ def main() -> None:
     parser.add_argument("--server-timeout", type=float, default=900)
     parser.add_argument("--port", type=int, default=18437)
     parser.add_argument("--tolerance", type=float, default=0.03, help="largest mean |delta logprob| on the diagonal")
+    parser.add_argument("--attention-kernel", choices=["auto", "dense", "triton"], default="auto")
+    parser.add_argument("--also-kernel", choices=["dense", "triton"], help="the tables again with this kernel")
     args = parser.parse_args()
 
     # `timeout` and a cancelled job send SIGTERM: leave through `finally`, so that the server does not outlive the check.
@@ -435,18 +453,36 @@ def main() -> None:
 
         torch.save({state: [vars(drawn) for drawn in samples[state]] for state in STATES}, work / "samples.pt")
 
-        table: dict[bool, dict[str, dict[str, tuple[float, float]]]] = {}
-        for replay in (True, False):
-            table[replay] = {served: {} for served in STATES}
-            for trained, snapshot in zip(STATES, snapshots):
-                trainer.restore(snapshot)
+        def tables(kernel: str) -> dict[bool, dict[str, dict[str, tuple[float, float, float]]]]:
+            table: dict[bool, dict[str, dict[str, tuple[float, float, float]]]] = {}
+            for replay in (True, False):
+                table[replay] = {served: {} for served in STATES}
+                for trained, snapshot in zip(STATES, snapshots):
+                    trainer.restore(snapshot)
+                    for served in STATES:
+                        table[replay][served][trained] = differences(trainer, samples[served], replay)
+                print(
+                    f"\n[{kernel} attention] mean (max) |delta logprob| and mismatch KL, "
+                    f"{'replaying' if replay else 'without'} the server's routing"
+                )
+                print("served \\ trained".ljust(18) + "".join(state.rjust(30) for state in STATES))
                 for served in STATES:
-                    table[replay][served][trained] = differences(trainer, samples[served], replay)
-            print(f"\nmean (max) |delta logprob|, {'replaying' if replay else 'without'} the server's routing")
-            print("served \\ trained".ljust(18) + "".join(state.rjust(20) for state in STATES))
-            for served in STATES:
-                cells = (f"{mean:.4f} ({largest:.2f})" for mean, largest in table[replay][served].values())
-                print(served.ljust(18) + "".join(cell.rjust(20) for cell in cells))
+                    cells = (
+                        f"{mean:.4f} ({largest:.2f}) {kl:.1e}" for mean, largest, kl in table[replay][served].values()
+                    )
+                    print(served.ljust(18) + "".join(cell.rjust(30) for cell in cells))
+            return table
+
+        table = tables(args.attention_kernel)
+        if args.also_kernel is not None:
+            use_kernel(trainer, args.also_kernel)
+            other = tables(args.also_kernel)
+            diagonal = [(table[True][state][state][0], other[True][state][state][0]) for state in STATES]
+            print(
+                f"\ndiagonal mean |delta logprob|, {args.attention_kernel} against {args.also_kernel}: "
+                + ", ".join(f"{state} {mine:.4f} / {theirs:.4f}" for state, (mine, theirs) in zip(STATES, diagonal))
+            )
+            use_kernel(trainer, args.attention_kernel)
         failures = []
         for served in STATES:
             on = table[True][served][served][0]
