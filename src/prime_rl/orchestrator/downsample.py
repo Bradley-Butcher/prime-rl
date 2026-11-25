@@ -96,4 +96,7 @@ def downsample_record(
 
 def trained_advantage(trace: vf.Trace) -> float | None:
     """A trace's advantage on its first trainable token: the whole trace's for a group-relative algorithm."""
-    return next((advantage for node in trace.nodes for advantage in node.advantages or []), None)
+    for node in trace.nodes:
+        if node.advantages is not None and len(node.advantages) > 0:
+            return float(node.advantages[0])
+    return None

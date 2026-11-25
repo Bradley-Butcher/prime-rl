@@ -23,8 +23,11 @@ LABELS = {0: ["fast"], 2: ["hard", "hops:1"]}
 
 def make_source() -> TrainSource:
     """Env ``a`` cycles four Tasks with ``kind`` and ``labels``; env ``b`` samples four by difficulty pool."""
-    a = [vf.Task(vf.WireTaskData(idx=i, kind="read" if i % 2 else "write", labels=LABELS.get(i, []))) for i in range(4)]
-    b = [vf.Task(vf.WireTaskData(idx=i, prompt="b")) for i in range(4)]
+    a = [
+        vf.Task(vf.WireTaskData(idx=i, id=f"a-{i}", kind="read" if i % 2 else "write", labels=LABELS.get(i, [])))
+        for i in range(4)
+    ]
+    b = [vf.Task(vf.WireTaskData(idx=i, id=f"b-{i}", prompt="b")) for i in range(4)]
     pool = CurriculumConfig(sampler=DifficultyPoolSamplerConfig(pools=POOLS))
     envs = [
         SimpleNamespace(name="a", tasks=iter(a), num_tasks=4, config=SimpleNamespace(ratio=1.0, group_size=1, curriculum=None)),
@@ -107,7 +110,7 @@ def test_named_sources_get_their_share_and_the_rest_keep_their_ratios(tmp_path):
             name=name,
             tasks=iter([vf.Task(vf.WireTaskData(idx=0, prompt=name))]),
             num_tasks=1,
-            config=SimpleNamespace(ratio=ratio, curriculum=None),
+            config=SimpleNamespace(ratio=ratio, group_size=1, curriculum=None),
         )
         for name, ratio in zip(names, ratios)
     ]
@@ -362,7 +365,7 @@ def test_stats_give_each_task_its_labels(tmp_path):
 
 def test_stats_aggregate_groups_by_label(tmp_path):
     source = planned_source(tmp_path)
-    client = TestClient(create_app(Controller(requires_step=True), [plan_router(source.plans)]))
+    client = TestClient(create_app(Controller(requires_step=True), routers=[plan_router(source.plans)]))
     a = source.tasks["a"]
     source.on_result(make_group(a[2], env="a", step=1, rewards=[0.0, 1.0]))
     source.on_result(make_group(a[2], env="a", step=2, rewards=[1.0, 1.0]))

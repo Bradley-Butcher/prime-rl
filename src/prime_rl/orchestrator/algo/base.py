@@ -49,9 +49,9 @@ def leave_out_unfinished_reply(trace: vf.Trace) -> None:
     if call is None or call.finish_reason is not None:
         return
     node = trace.nodes[call.node]
-    node.mask = [False] * len(node.mask)
-    node.logprobs = []
-    node.sampling_mask = None
+    node.mask = np.zeros(len(node.mask), dtype=np.bool_)
+    node.logprobs = np.empty(0, dtype=np.float32)
+    node.sampler_support = None
 
 
 def score_timeout_as_failure(trace: vf.Trace) -> None:
@@ -106,7 +106,7 @@ class Algorithm:
                 continue
             if self.timeouts_as_failures and trace.stop_condition == AGENT_TIMEOUT:
                 leave_out_unfinished_reply(trace)
-                if any(any(node.mask) for node in trace.nodes):
+                if any(np.any(node.mask) for node in trace.nodes):
                     rescued |= trace.has_error
                     score_timeout_as_failure(trace)
                     continue

@@ -137,7 +137,10 @@ def build_run(run_dir: Path) -> Path:
         ]
         envs.append(
             SimpleNamespace(
-                name=name, tasks=iter(tasks), num_tasks=len(tasks), config=SimpleNamespace(ratio=ratio, curriculum=None)
+                name=name,
+                tasks=iter(tasks),
+                num_tasks=len(tasks),
+                config=SimpleNamespace(ratio=ratio, group_size=GROUP_SIZE, curriculum=None),
             )
         )
     source = TrainSource(envs)
@@ -261,7 +264,7 @@ def test_the_view_pools_groups_and_rollouts_as_the_records_say(tmp_path):
 def test_a_rollout_counts_as_gather_counts_it():
     task = vf.Task(vf.WireTaskData(idx=0, prompt="p", kind="read", labels=["interface:rpc"]))
     episode = rollout_episode("a", task, step=3, reward=0.0, rng=random.Random(4), group="g")
-    record = json.loads(json.dumps(episode.to_record()))
+    record = json.loads(episode.to_json())
     item = rollout(record)
 
     calls = [

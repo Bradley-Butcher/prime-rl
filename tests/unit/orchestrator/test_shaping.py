@@ -97,7 +97,7 @@ SHAPED = [1.025, 0.925, -0.975, -0.975]  # rewards 1, 0.9, -1, -1
 
 def live(directory, *, replay_from=None, resume_step=None):
     """A GRPO env ``a`` with timeouts trained as failures, its plans and its live shaping."""
-    tasks = [vf.Task(vf.WireTaskData(idx=i, prompt="a")) for i in range(2)]
+    tasks = [vf.Task(vf.WireTaskData(idx=i, id=f"a-{i}", prompt="a")) for i in range(2)]
     env = SimpleNamespace(
         name="a", tasks=iter(tasks), num_tasks=2, config=SimpleNamespace(ratio=1.0, group_size=1, curriculum=None)
     )
@@ -367,16 +367,16 @@ def test_by_default_the_gate_judges_a_group_without_the_turn_penalty(gate_on_raw
     # 0.8, and 1, 0.8 and 0.
     scored = {"passes that differ in turns": [1 / 12, 1 / 30, -7 / 60], "two passes and a failure": [0.4, 0.2, -0.6]}
     for name, group in groups.items():
-        assert [episode.traces[0].nodes[1].advantages[0] for episode in group] == pytest.approx(scored[name])
+        assert [episode.traces[0].nodes[1].advantages[0] for episode in group] == pytest.approx(scored[name], abs=1e-6)
         for episode, advantage in zip(group, scored[name]):
             for sample in sink.pending_batch.get(episode.traces[0].id, []):
-                assert trained_advantage(sample) == pytest.approx(advantage)
+                assert trained_advantage(sample) == pytest.approx(advantage, abs=1e-6)
 
 
 def downsampled(directory, baseline: str) -> tuple[TrainSink, TrainSource]:
     """A train sink over env ``a`` rolling out 12 rollouts a Task and training 8, with the zero-advantage gate, the
     curriculum records and live shaping, the turn penalty at 0.5."""
-    tasks = [vf.Task(vf.WireTaskData(idx=i, prompt="a")) for i in range(2)]
+    tasks = [vf.Task(vf.WireTaskData(idx=i, id=f"a-{i}", prompt="a")) for i in range(2)]
     curriculum = CurriculumConfig(gates={"zero_advantage": AdvRangeGateConfig()})
     env = SimpleNamespace(
         name="a",

@@ -810,7 +810,7 @@ def test_train_sources_can_use_their_own_group_sizes():
     assert [source.group_size for source in orchestrator(64).train.source] == [16, 8]
     with pytest.raises(ValidationError, match="divisible by every train source"):
         orchestrator(40)
-    with pytest.raises(ValidationError, match="largest train group_size"):
+    with pytest.raises(ValidationError, match="most rollouts a train source dispatches"):
         orchestrator(64, max_inflight=8)
 
 
