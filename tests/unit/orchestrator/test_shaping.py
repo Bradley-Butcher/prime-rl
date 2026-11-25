@@ -203,7 +203,9 @@ def test_a_change_applies_from_its_step_on_and_never_to_groups_already_dispatche
 
 def test_the_api_refuses_a_started_step_and_bad_changes_and_shows_the_setting(tmp_path):
     source, _, shaping = live(tmp_path)
-    client = TestClient(create_app(Controller(requires_step=True), routers=[plan_router(source.plans, shaping=shaping)]))
+    client = TestClient(
+        create_app(Controller(requires_step=True), routers=[plan_router(source.plans, shaping=shaping)])
+    )
     source.next_task(step=1)
 
     started = client.post("/v1/shaping", json={"step": 1, **STUCK_ON})
@@ -458,7 +460,9 @@ def test_the_turn_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tm
 
 def test_the_turn_penalty_is_set_live_from_a_step_on_as_the_other_levers_are(tmp_path):
     source, algorithm, shaping = live(tmp_path)
-    client = TestClient(create_app(Controller(requires_step=True), routers=[plan_router(source.plans, shaping=shaping)]))
+    client = TestClient(
+        create_app(Controller(requires_step=True), routers=[plan_router(source.plans, shaping=shaping)])
+    )
     source.next_task(step=1)
     in_flight = turns_group(step=1, group="in-flight")
 

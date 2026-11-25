@@ -647,7 +647,12 @@ def train(config: TrainerConfig):
             )
 
             done, total = micro_step + 1, len(micro_batches)
-            if annotate and config.log.micro_step_interval and done % config.log.micro_step_interval == 0 and done < total:
+            if (
+                annotate
+                and config.log.micro_step_interval
+                and done % config.log.micro_step_interval == 0
+                and done < total
+            ):
                 elapsed = time.perf_counter() - fb_start_time
                 left = elapsed / done * (total - done)
                 logger.info(

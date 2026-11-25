@@ -30,8 +30,12 @@ def make_source() -> TrainSource:
     b = [vf.Task(vf.WireTaskData(idx=i, id=f"b-{i}", prompt="b")) for i in range(4)]
     pool = CurriculumConfig(sampler=DifficultyPoolSamplerConfig(pools=POOLS))
     envs = [
-        SimpleNamespace(name="a", tasks=iter(a), num_tasks=4, config=SimpleNamespace(ratio=1.0, group_size=1, curriculum=None)),
-        SimpleNamespace(name="b", tasks=iter(b), num_tasks=4, config=SimpleNamespace(ratio=3.0, group_size=1, curriculum=pool)),
+        SimpleNamespace(
+            name="a", tasks=iter(a), num_tasks=4, config=SimpleNamespace(ratio=1.0, group_size=1, curriculum=None)
+        ),
+        SimpleNamespace(
+            name="b", tasks=iter(b), num_tasks=4, config=SimpleNamespace(ratio=3.0, group_size=1, curriculum=pool)
+        ),
     ]
     return TrainSource(envs)
 

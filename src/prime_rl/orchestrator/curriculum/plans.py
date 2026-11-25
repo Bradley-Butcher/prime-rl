@@ -12,14 +12,10 @@ JSONL files in one directory keep the run repeatable:
   trained under (``prime_rl.orchestrator.curriculum.shaping``, whose changes ``shaping.jsonl`` records). A
   down-sampled group's outcome is over every rollout, with the rollouts it trains on under ``kept``.
 
-<<<<<<< HEAD
-=======
-With ``batch_selection``, ``selection.jsonl`` holds how each admitted group left the selection pool: trained at a
-step, or dropped (``prime_rl.orchestrator.selection``). Its ``step`` is the step it left at. With a down-sampled
-source, ``downsample.jsonl`` lists every rollout of each group, kept or left out, with the advantage it trains with
-(``prime_rl.orchestrator.downsample``); its ``step`` is the dispatch step, as in ``groups.jsonl``.
+With a down-sampled source, ``downsample.jsonl`` lists every rollout of each group, kept or left out, with the
+advantage it trains with (``prime_rl.orchestrator.downsample``); its ``step`` is the dispatch step, as in
+``groups.jsonl``.
 
->>>>>>> bc50c44fe (feat(orchestrator): PODS rollout down-sampling, and ingest_while_shipping without the selection pool)
 A resume reads them back, keeping the dispatch and group records up to its step.
 """
 
@@ -505,6 +501,7 @@ class Plans:
         """Append a down-sampled group's rollouts (``prime_rl.orchestrator.downsample.downsample_record``)."""
         with self.lock:
             _append(self.downsample_path, record)
+
     def close(self) -> None:
         """Summarize the step dispatching now, as the next step's dispatch would."""
         with self.lock:

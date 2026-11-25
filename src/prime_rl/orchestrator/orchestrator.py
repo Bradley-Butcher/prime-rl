@@ -895,6 +895,7 @@ class Orchestrator:
             self.train_sink.shipping = False
             if not send.done():
                 await safe_cancel(send)
+
     async def start_draining(self, reason: str) -> None:
         """Stop scheduling train work and let the pipeline empty; triggered
         eval epochs still run to completion."""
