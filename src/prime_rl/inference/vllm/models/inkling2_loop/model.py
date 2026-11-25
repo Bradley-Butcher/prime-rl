@@ -5,19 +5,21 @@ loading derives further tensors from the weights. The trainer holds the experts 
 while the server runs. ``Inkling2LoopForRL`` is vLLM's model with what that takes:
 
 - BF16 routed experts (``Inkling2BF16Experts``), built from vLLM's own kernels: its Hopper router, activation and
-  top-k combine, and the grouped GEMM of its expert LoRA path.
+  top-k combine, and the grouped GEMM of its expert LoRA path. They take expert LoRA adapters through vLLM's hook
+  (``ExpertsLoRA``); vLLM's attention layers take theirs without it.
 - FP8 routed experts (``Inkling2FP8Experts`` in ``fp8_experts.py``), selected with
   ``inference.vllm.quantization = "fp8_per_block"``: the format and the kernels of vLLM's online ``fp8_per_block``
   experts, with the routing weights applied after the second product and summed in FP32, as the trainer's
-  ``model.moe.compute.type = "deepgemm_fp8"`` computes them. They take BF16 weights and round them as they load.
-  Their module is imported only when they are selected, so a BF16 server does not depend on vLLM's FP8 kernels.
+  ``model.moe.compute.type = "deepgemm_fp8"`` computes them. They take BF16 weights and round them as they load, and
+  take no LoRA adapters. Their module is imported only when they are selected, so a BF16 server does not depend on
+  vLLM's FP8 kernels.
 - A ``load_weights`` that serves both the cold start and every weight update. It writes into the tensors the
   model already serves and refreshes the derived ones in place, since captured CUDA graphs hold their addresses.
 - The trainer's values for the depth-mix and loop-message queries. The checkpoint stores them in FP32; the
   trainer computes with their BF16 rounding (FSDP casts every parameter to BF16), so the server rounds them too.
 
-The BF16 experts, the in-place refresh of the derived tensors and the class names are adapted from the Inkling 2
-vLLM plugin developed for SkyRL (Apache-2.0):
+The BF16 experts with their LoRA hook, the in-place refresh of the derived tensors, the loading under LoRA wrappers
+and the class names are adapted from the Inkling 2 vLLM plugin developed for SkyRL (Apache-2.0):
 https://github.com/erictang000/SkyRL/blob/faae9039fb0f4b6be27c02dc0045c1de63e3b888/skyrl/backends/skyrl_train/patches/vllm/inkling2/model.py
 ``load_weights`` is adapted from ``Inkling2ForConditionalGeneration.load_weights`` of vLLM (Apache-2.0; added by
 vllm-project/vllm#67325, read at commit b426b46e6).
@@ -42,7 +44,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.models.inkling2.nvidia.attention import Inkling2Attention
 from vllm.models.inkling2.nvidia.loop import Inkling2LoopForConditionalGeneration
-from vllm.models.inkling2.nvidia.moe import Inkling2Gate, Inkling2MoE, Inkling2RoutingCapture
+from vllm.models.inkling2.nvidia.moe import ExpertsLoRA, Inkling2Gate, Inkling2MoE, Inkling2RoutingCapture
 from vllm.models.inkling2.nvidia.ops.grouped_gemm import grouped_gemm
 from vllm.models.inkling2.nvidia.ops.moe import combine
 from vllm.models.inkling2.nvidia.ops.moe_sm90 import select_experts, swiglu
@@ -61,8 +63,9 @@ class Inkling2BF16Experts(nn.Module):
     """One layer's routed experts with BF16 weights in the checkpoint's layout: ``w13_weight [E, 2I, H]`` holds the
     gate projection in its even rows and the up projection in its odd rows, ``w2_weight [E, H, I]`` projects down."""
 
-    # vLLM puts LoRA adapters on an MoE's experts unless they say otherwise. These take none.
-    supports_lora = False
+    # vLLM wraps the MoE in `Inkling2MoEWithLoRA`, which reads the sizes and the expert-parallel rank below.
+    supports_lora = True
+    ep_rank = 0
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -70,6 +73,7 @@ class Inkling2BF16Experts(nn.Module):
         self.gate_cap = config.mlp_gate_softcap
         self.up_cap = config.mlp_up_softcap
         num_experts, hidden, intermediate = config.n_routed_experts, config.hidden_size, config.intermediate_size
+        self.num_experts, self.hidden_size, self.intermediate_size = num_experts, hidden, intermediate
         self.w13_weight = nn.Parameter(
             torch.empty(num_experts, 2 * intermediate, hidden, dtype=torch.bfloat16), requires_grad=False
         )
@@ -78,12 +82,15 @@ class Inkling2BF16Experts(nn.Module):
         )
         self.register_buffer("expert_bounds", torch.arange(num_experts + 1, dtype=torch.int32), persistent=False)
 
-    def forward(self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, lora: ExpertsLoRA | None = None
+    ) -> torch.Tensor:
         """
         Args:
             x: ``[T, H]`` BF16.
             ids: ``[T, topk]`` int32 expert of every routing slot, -1 for the slots of a padding token.
             weights: ``[T * topk]`` FP32 routing weights.
+            lora: adds each row's expert adapter to the two products, before the activation and before the sum.
 
         Returns:
             ``[T, H]`` BF16. The routing weight scales the activation, before the down projection, and a token's
@@ -95,8 +102,12 @@ class Inkling2BF16Experts(nn.Module):
         sorted_ids, order = torch.sort(flat_ids, stable=True)
         offsets = torch.searchsorted(sorted_ids, self.expert_bounds, out_int32=True)
         gate_up = grouped_gemm(x, self.w13_weight, order, offsets, num_rows, self.topk, gather=True)
+        if lora is not None:
+            lora.add_w13(gate_up, x, order, offsets, self.topk)
         activated = swiglu(gate_up, weights[order], sorted_ids, self.gate_cap, self.up_cap)
         down = grouped_gemm(activated, self.w2_weight, order, offsets, num_rows, self.topk, gather=False)
+        if lora is not None:
+            lora.add_w2(down, activated, order, offsets, self.topk)
         row_of_slot = torch.empty(num_rows, dtype=torch.int32, device=x.device)
         row_of_slot[order] = torch.arange(num_rows, dtype=torch.int32, device=x.device)
         return combine(down, torch.where(flat_ids >= 0, row_of_slot, -1), self.topk, x.dtype)
@@ -116,9 +127,15 @@ class Inkling2RLMoE(Inkling2MoE):
             "all_experts", torch.tensor([0, config.n_routed_experts], dtype=torch.int32), persistent=False
         )
 
-    def forward(self, x: torch.Tensor, reduce: bool = True, push=None, lora=None, pass_idx: int = 0) -> torch.Tensor:
-        if not reduce or push is not None or lora is not None:
-            raise NotImplementedError("The RL Inkling 2 experts run on one GPU, without LoRA")
+    def forward(
+        self, x: torch.Tensor, reduce: bool = True, push=None, lora: ExpertsLoRA | None = None, pass_idx: int = 0
+    ) -> torch.Tensor:
+        """``lora`` is vLLM's wrapper of this module (``Inkling2MoEWithLoRA``), which calls it on every loop pass of the
+        layer with the same adapters."""
+        if not reduce or push is not None:
+            raise NotImplementedError("The RL Inkling 2 experts run on one GPU")
+        if lora is not None and not self.experts.supports_lora:
+            raise NotImplementedError(f"{type(self.experts).__name__} takes no LoRA adapters: serve BF16 experts")
         x = x.contiguous()
         gate = self.gate
         ids, weights, _ = select_experts(x, gate.weight, gate.bias, gate.topk, gate.route_scale, self.all_experts)
@@ -129,7 +146,9 @@ class Inkling2RLMoE(Inkling2MoE):
             is_padding = get_forward_context().is_padding
             if is_padding is not None:
                 ids = torch.where(is_padding.unsqueeze(1), -1, ids)
-        return self.experts(x, ids, weights)
+        if lora is None:
+            return self.experts(x, ids, weights)
+        return self.experts(x, ids, weights, lora)
 
 
 class Inkling2LoopForRL(Inkling2LoopForConditionalGeneration):
@@ -140,6 +159,11 @@ class Inkling2LoopForRL(Inkling2LoopForConditionalGeneration):
         if get_tensor_model_parallel_world_size() != 1:
             raise NotImplementedError(
                 "Inkling 2 for RL runs one replica per GPU: use data_parallel_size instead of tensor_parallel_size"
+            )
+        if vllm_config.lora_config is not None and vllm_config.lora_config.target_modules is not None:
+            raise ValueError(
+                "Inkling 2 for RL takes no lora_target_modules: vLLM would load an adapter's other modules without an "
+                "error and serve them without their adapter"
             )
         expert_format = getattr(vllm_config.model_config.hf_config, INKLING2_LOOP_EXPERT_FORMAT_ATTRIBUTE, "bf16")
         if expert_format not in EXPERT_FORMATS:
@@ -159,10 +183,11 @@ class Inkling2LoopForRL(Inkling2LoopForConditionalGeneration):
         """Load a checkpoint, or a weight update, in checkpoint names. Every tensor of the language model must be
         there, with the checkpoint's dtypes and BF16 experts. The vision tower may be left out: the trainer does
         not hold it. FP8 experts round their BF16 weights as they load."""
-        params = dict(self.named_parameters())
+        # With LoRA enabled, vLLM's adapter wrappers hold the modules they wrap as `base_layer`.
+        params = {name.replace(".base_layer.", "."): param for name, param in self.named_parameters()}
         # FP8 experts are told by their rounding loader, not by their class: a BF16 server never imports their module.
         fp8_weights = {
-            f"{prefix}.{attribute}": (module, attribute)
+            f"{prefix.replace('.base_layer.', '.')}.{attribute}": (module, attribute)
             for prefix, module in self.named_modules()
             if hasattr(module, "load_bf16_weight")
             for attribute in ("w13_weight", "w2_weight")

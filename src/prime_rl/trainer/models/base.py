@@ -153,6 +153,12 @@ class PreTrainedModelPrimeRL(nn.Module):
         return None
 
     @classmethod
+    def lora_target_blocker(cls, name: str) -> str | None:
+        """Why the weight ``name`` (a parameter, or a module that owns parameters) cannot take a LoRA adapter, or
+        ``None`` if it can. Asked of every weight that ``lora.target_modules`` matches."""
+        return None
+
+    @classmethod
     def cuda_graph_blocker(cls, config) -> str | None:
         """Why this architecture's compiled layers cannot be recorded as CUDA graphs, or ``None`` if they can."""
         return None
@@ -239,6 +245,12 @@ class PreTrainedModelPrimeRL(nn.Module):
         use the returned value. Default implementation is a no-op.
         """
         return state_dict
+
+    @classmethod
+    def adapter_rank_multipliers(cls) -> dict[str, int]:
+        """The modules, by the end of their name in the exported adapter (``convert_adapter_to_hf``), that hold a
+        multiple of ``lora.rank``, and that multiple."""
+        return {}
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize the parameters and buffers `module` owns directly."""

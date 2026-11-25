@@ -104,7 +104,10 @@ class LoRAConfig(BaseConfig):
         "fc1_latent_proj",
         "fc2_latent_proj",
     ]
-    """Module names or regex patterns to apply LoRA to. Simple names (e.g. ``q_proj``) match any component in the module path; regex patterns match anywhere in the name. Names unknown to the current model are silently ignored, so defaults cover multiple architectures. NemotronH note: ``experts`` matches the ReLU² grouped experts; ``fc1_latent_proj``/``fc2_latent_proj`` adapt the latent projections. Add ``in_proj``/``out_proj`` to also LoRA Mamba."""
+    """Module names or regex patterns to apply LoRA to. Simple names (e.g. ``q_proj``) match any component in the module path; regex patterns match anywhere in the name. Names unknown to the current model are silently ignored, so defaults cover multiple architectures. NemotronH note: ``experts`` matches the ReLU² grouped experts; ``fc1_latent_proj``/``fc2_latent_proj`` adapt the latent projections. Add ``in_proj``/``out_proj`` to also LoRA Mamba. Inkling 2 Mini note: the defaults match its loop message gates, which take no adapter, so name the targets (see the LoRA section of ``docs/advanced.md``)."""
+
+    dtype: Literal["bfloat16", "float32"] | None = None
+    """dtype of the adapter's parameters, which the optimizer updates in place. None keeps the base layers' dtype (``optimization_dtype``). ``float32`` over a ``bfloat16`` base keeps updates smaller than half a bf16 unit of a weight, which bf16 weights round away; the base stays in ``optimization_dtype``, the forward still computes in bf16 (FSDP's param dtype), and the adapter is broadcast to inference in the base layers' dtype."""
 
 
 class DebugModelConfig(BaseConfig):

@@ -31,7 +31,14 @@ class LoRAGroupedExperts(LoRAModule):
     Exports the vLLM per-expert MoE LoRA format. Tokens arrive already permuted by the token dispatcher.
     """
 
-    def __init__(self, base_layer: GroupedExperts, rank: int, alpha: float = 32.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        base_layer: GroupedExperts,
+        rank: int,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
+    ):
         super().__init__(base_layer, rank, alpha, dropout)
         self.num_experts = base_layer.num_experts
         gated = base_layer.gate_proj is not None
@@ -40,8 +47,8 @@ class LoRAGroupedExperts(LoRAModule):
         for proj in self.projections:
             weight = getattr(base_layer, proj)
             num_experts, out_features, in_features = weight.shape
-            setattr(self, f"{proj}_lora_A", lora_parameter(num_experts, rank, in_features, like=weight))
-            setattr(self, f"{proj}_lora_B", lora_parameter(num_experts, out_features, rank, like=weight))
+            setattr(self, f"{proj}_lora_A", lora_parameter(num_experts, rank, in_features, like=weight, dtype=dtype))
+            setattr(self, f"{proj}_lora_B", lora_parameter(num_experts, out_features, rank, like=weight, dtype=dtype))
         self.reset_parameters()
 
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:
@@ -79,15 +86,22 @@ class LoRAGptOssGroupedExperts(LoRAModule):
     gate_proj/up_proj runtime weights.
     """
 
-    def __init__(self, base_layer: GroupedExperts, rank: int, alpha: float = 32.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        base_layer: GroupedExperts,
+        rank: int,
+        alpha: float = 32.0,
+        dropout: float = 0.0,
+        dtype: torch.dtype | None = None,
+    ):
         super().__init__(base_layer, rank, alpha, dropout)
         self.num_experts, intermediate_size, hidden_size = base_layer.up_proj.shape
         _check_grouped_mm_dims(rank, hidden_size, intermediate_size)
         n, up, down = self.num_experts, base_layer.up_proj, base_layer.down_proj
-        self.gate_up_lora_A = lora_parameter(n, rank, hidden_size, like=up)
-        self.gate_up_lora_B = lora_parameter(n, 2 * intermediate_size, rank, like=up)
-        self.down_lora_A = lora_parameter(n, rank, intermediate_size, like=down)
-        self.down_lora_B = lora_parameter(n, hidden_size, rank, like=down)
+        self.gate_up_lora_A = lora_parameter(n, rank, hidden_size, like=up, dtype=dtype)
+        self.gate_up_lora_B = lora_parameter(n, 2 * intermediate_size, rank, like=up, dtype=dtype)
+        self.down_lora_A = lora_parameter(n, rank, intermediate_size, like=down, dtype=dtype)
+        self.down_lora_B = lora_parameter(n, hidden_size, rank, like=down, dtype=dtype)
         self.reset_parameters()
 
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:

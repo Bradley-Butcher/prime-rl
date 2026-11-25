@@ -33,11 +33,12 @@ class LoRAState:
         self._modules.append((prefix, module))
 
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:
-        """Adapter-only state dict, converted for HF compatibility when a converter is registered."""
+        """Adapter-only state dict in the adapted weights' dtype (an adapter held in another dtype, ``lora.dtype``,
+        is cast), converted for HF compatibility when a converter is registered."""
         state_dict = {}
         for prefix, module in self._modules:
             for name, tensor in module.adapter_state_dict().items():
-                state_dict[f"{prefix}.{name}"] = tensor
+                state_dict[f"{prefix}.{name}"] = tensor.to(module.base_dtype)
 
         if self._adapter_state_dict_converter is not None:
             state_dict = self._adapter_state_dict_converter(state_dict)
@@ -121,6 +122,27 @@ def _find_target_modules(model: nn.Module, target_patterns: List[str]) -> List[s
     return target_modules
 
 
+def _refuse_unservable_targets(model: nn.Module, target_patterns: List[str]) -> None:
+    """Refuse patterns that match a weight the model cannot train an adapter on, including weights that LoRA would
+    skip because they belong to no linear layer (``_find_target_modules``)."""
+    owners = [name for name, module in model.named_modules() if any(True for _ in module.parameters(recurse=False))]
+    blocked: dict[str, list[str]] = {}
+    for name in (*owners, *(name for name, _ in model.named_parameters())):
+        if any(_matches_pattern(name, pattern) for pattern in target_patterns):
+            reason = type(model).lora_target_blocker(name)
+            if reason is not None:
+                blocked.setdefault(reason, []).append(name)
+    if blocked:
+        matches = "; ".join(
+            f"{', '.join(names[:3])}{f' and {len(names) - 3} more' if len(names) > 3 else ''}: {reason}"
+            for reason, names in blocked.items()
+        )
+        raise ValueError(
+            f"lora.target_modules = {target_patterns} matches weights that {model.config.model_type!r} cannot train "
+            f"an adapter on. {matches}"
+        )
+
+
 def freeze_all_except_lora(model: nn.Module) -> None:
     """Freeze all parameters except the LoRA adapters."""
     for name, param in model.named_parameters():
@@ -145,6 +167,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
         lora_blocker = type(model).lora_blocker(model.config)
         if lora_blocker is not None:
             raise ValueError(f"{model.config.model_type!r} cannot train with LoRA: {lora_blocker}")
+        _refuse_unservable_targets(model, config.target_modules)
 
     lora_state = setup_lora_state()
     if isinstance(model, PreTrainedModelPrimeRL):
@@ -170,6 +193,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
     if not target_modules:
         raise ValueError(f"No LoRA target modules found for patterns {config.target_modules}.")
 
+    dtype = getattr(torch, config.dtype) if config.dtype is not None else None
     for module_name in target_modules:
         base_module = model.get_submodule(module_name)
         if isinstance(base_module, nn.Linear):
@@ -178,7 +202,7 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             wrapper = LoRAGptOssGroupedExperts
         else:
             wrapper = LoRAGroupedExperts
-        lora_module = wrapper(base_module, rank=config.rank, alpha=config.alpha, dropout=config.dropout)
+        lora_module = wrapper(base_module, rank=config.rank, alpha=config.alpha, dropout=config.dropout, dtype=dtype)
         lora_state.register_module(module_name, lora_module)
         model.set_submodule(module_name, lora_module)
 
@@ -187,7 +211,8 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
     adapter_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(
-        f"LoRA enabled: {adapter_params:,} adapter params on {len(target_modules)} modules ({total_params:,} total)"
+        f"LoRA enabled: {adapter_params:,} adapter params ({config.dtype or 'the base layers'} dtype) on "
+        f"{len(target_modules)} modules ({total_params:,} total)"
     )
 
 
@@ -195,12 +220,15 @@ def has_lora_layers(model: nn.Module) -> bool:
     return any(isinstance(module, LoRAModule) for module in model.modules())
 
 
-def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropout: float) -> None:
+def save_lora_config(
+    model: nn.Module, state_dict: dict[str, torch.Tensor], save_path, rank: int, alpha: float, dropout: float
+) -> None:
     """
     Save LoRA configuration as JSON for adapter portability.
 
     Args:
         model: Model with LoRA layers to introspect
+        state_dict: The exported adapter, as saved next to the configuration
         save_path: Path object or string pointing to directory where adapter_config.json will be saved
         rank: LoRA rank
         alpha: LoRA alpha scaling parameter
@@ -208,6 +236,8 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
     """
     import json
     from pathlib import Path
+
+    from prime_rl.trainer.models import PreTrainedModelPrimeRL
 
     save_path = Path(save_path)
 
@@ -223,6 +253,17 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
         "bias": "none",
         "target_modules": sorted(target_modules),
     }
+
+    if isinstance(model, PreTrainedModelPrimeRL):
+        # PEFT scales a module's adapter by its alpha over its rank, so both grow together.
+        multipliers = {
+            module: multiplier
+            for module, multiplier in type(model).adapter_rank_multipliers().items()
+            if any(f".{module}.lora_" in name for name in state_dict)
+        }
+        if multipliers:
+            adapter_config["rank_pattern"] = {module: m * rank for module, m in multipliers.items()}
+            adapter_config["alpha_pattern"] = {module: m * alpha for module, m in multipliers.items()}
 
     config_path = save_path / "adapter_config.json"
     with open(config_path, "w") as f:

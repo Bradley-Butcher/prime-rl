@@ -678,6 +678,10 @@ async def load_lora_adapter(admin_plane: AdminPlane, lora_name: str, lora_path: 
             params={"weight_version": step},
             timeout=httpx.Timeout(connect=10.0, read=LORA_LOAD_READ_TIMEOUT_S, write=60.0, pool=10.0),
         )
+        if response.is_error:
+            # vLLM answers an adapter it refuses (a rank above max_lora_rank, a module it does not adapt) with a 500,
+            # which is retried: the reason is in the body alone.
+            logger.warning(f"Loading LoRA adapter {lora_name} failed ({response.status_code}): {response.text[:500]}")
         response.raise_for_status()
 
     await asyncio.gather(*[_load_lora_adapter(client) for client in admin_plane.clients])

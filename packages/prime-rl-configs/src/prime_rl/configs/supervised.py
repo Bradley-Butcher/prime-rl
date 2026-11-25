@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 from pydantic import Field, model_validator
 
 from prime_rl.configs.eval import SFTOnlineEvalConfig
-from prime_rl.configs.inference import InferenceConfig, setup_dummy_load
+from prime_rl.configs.inference import InferenceConfig, setup_dummy_load, setup_inference_lora
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.monitors import MonitorsConfig
 from prime_rl.configs.shared import (
@@ -268,8 +268,7 @@ class SupervisedTrainerConfig(BaseTrainerConfig):
         # LoRA runs broadcast the raw adapter, which evals reload via /load_lora_adapter
         if self.model.lora is not None:
             if self.inference is not None:
-                self.inference.vllm.enable_lora = True
-                self.inference.vllm.max_lora_rank = self.model.lora.rank
+                setup_inference_lora(self.inference, self.model.lora.rank)
             else:
                 warnings.warn(
                     "LoRA is enabled, but inference is not configured. When manually starting the inference server, "

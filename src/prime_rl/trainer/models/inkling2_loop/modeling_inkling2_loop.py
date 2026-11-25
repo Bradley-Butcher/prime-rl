@@ -22,6 +22,7 @@ except attention, which the ranks compute head-sharded over the whole row, and t
 tokens before a shard from the rank that holds them.
 """
 
+import re
 from functools import cache
 
 import torch
@@ -35,7 +36,9 @@ from prime_rl.trainer.models.inkling2_loop.configuration_inkling2_loop import (
     Inkling2LoopTextConfig,
 )
 from prime_rl.trainer.models.inkling2_loop.converting_inkling2_loop import (
+    ATTENTION_PROJECTIONS,
     conversion_chain,
+    convert_adapter,
     is_hf_state_dict,
     is_prime_state_dict,
 )
@@ -64,6 +67,11 @@ FP32_CHECKPOINT_TENSORS = (
     "norm.query",
     "message_queries",
     "selection_bias",
+)
+
+LORA_ATTENTION_TARGETS = tuple(prime_name for _, prime_name in ATTENTION_PROJECTIONS)
+LORA_TARGET_RE = re.compile(
+    rf"model\.layers\.\d+\.(self_attn\.({'|'.join(LORA_ATTENTION_TARGETS)})|mlp\.experts)(\.|$)"
 )
 
 
@@ -219,11 +227,22 @@ class Inkling2LoopPreTrainedModel(PreTrainedModelPrimeRL):
         return None
 
     @classmethod
-    def lora_blocker(cls, config) -> str | None:
+    def lora_target_blocker(cls, name: str) -> str | None:
+        # The weights that vLLM's Inkling 2 serves adapters on (`vllm/models/inkling2/nvidia/lora.py`).
+        if LORA_TARGET_RE.match(name):
+            return None
         return (
-            "its adapters have no export to the serving stack's layout (checkpoint names, one stacked adapter per "
-            "expert projection), and the loop message gates take no adapter there"
+            f"vLLM serves adapters on the attention projections ({', '.join(LORA_ATTENTION_TARGETS)}) and experts only"
         )
+
+    @classmethod
+    def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        return convert_adapter(state_dict)
+
+    @classmethod
+    def adapter_rank_multipliers(cls) -> dict[str, int]:
+        # One adapter holds the gate's and the up projection's ranks.
+        return {"mlp.experts.w13_weight": 2}
 
     @classmethod
     def cuda_graph_blocker(cls, config) -> str | None:

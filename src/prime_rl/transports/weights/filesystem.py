@@ -53,6 +53,7 @@ class FileSystemWeightSender(WeightSender):
                 save_state_dict(state_dict, step_dir, save_sharded=False, adapter=True)
                 save_lora_config(
                     model,
+                    state_dict,
                     step_dir,
                     rank=self.lora_config.rank,
                     alpha=self.lora_config.alpha,
