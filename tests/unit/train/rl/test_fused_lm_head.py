@@ -204,15 +204,20 @@ def test_fused_lm_head_frozen_weight_backward_cpu():
     assert lm.weight.grad is None
 
 
-def test_fused_lm_head_softcap_matches_full_logits_cpu():
-    """With a final-logit softcap, logprobs, entropy, summed cross-entropy and their gradients match full logits."""
+@pytest.mark.parametrize(
+    "device, v", [("cpu", 37), pytest.param("cuda", 37, marks=pytest.mark.gpu), pytest.param("cuda", 8203, marks=pytest.mark.gpu)]
+)  # fmt: skip
+def test_fused_lm_head_softcap_matches_full_logits(device, v):
+    """With a final-logit softcap, logprobs, entropy, summed cross-entropy and their gradients match full logits. On
+    CUDA the fused kernels compute them, on any part of a block of columns and over several vocabulary chunks."""
     torch.manual_seed(0)
-    b, s, h, v = 2, 4, 8, 37
+    b, s, h = 2, 4, 8
     softcap = 3.0
-    temperature = torch.full((b, s), 1.7, dtype=torch.float32)
-    hidden0 = torch.randn(b, s, h, dtype=torch.float32, requires_grad=True)
-    weight0 = torch.randn(v, h, dtype=torch.float32, requires_grad=True)
-    labels = torch.randint(0, v, (b, s), dtype=torch.long)
+    temperature = torch.linspace(0.5, 1.7, b * s, device=device).view(b, s)
+    hidden0 = torch.randn(b, s, h, dtype=torch.float32, device=device, requires_grad=True)
+    weight0 = torch.randn(v, h, dtype=torch.float32, device=device, requires_grad=True)
+    labels = torch.randint(0, v, (b, s), dtype=torch.long, device=device)
+    labels[1, 2], labels[1, 3] = v - 1, 0
     labels[0, 1] = -100
 
     logits = softcap * torch.tanh(hidden0 @ weight0.t() / softcap)
@@ -233,6 +238,8 @@ def test_fused_lm_head_softcap_matches_full_logits_cpu():
     torch.testing.assert_close(loss, ce0, rtol=0, atol=1e-4)
     torch.testing.assert_close(hidden1.grad, hidden0.grad, rtol=0, atol=1e-4)
     torch.testing.assert_close(lm.weight.grad, weight0.grad, rtol=0, atol=1e-4)
+    with torch.no_grad():
+        torch.testing.assert_close(lm(hidden1, labels)["loss"], ce0, rtol=0, atol=1e-4)
 
     vanilla = VanillaOutputLinear(in_features=h, out_features=v, softcap=softcap)
     vanilla.weight = torch.nn.Parameter(weight0.detach().clone())

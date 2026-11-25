@@ -411,6 +411,24 @@ def test_packed_documents_do_not_see_each_other():
     assert (changed[later] - packed[later]).abs().amax(dim=-1).min() > 1e-2
 
 
+def test_sliding_layers_see_one_window_of_their_document():
+    """``first_key`` is the first of the ``sliding_window_size`` keys up to the query, itself included, or its document's
+    first token. Full layers see the whole document."""
+    model = _randomized_model(_text_config())
+    seen = {}
+
+    def record(layer, args, kwargs):
+        seen[layer.is_sliding] = kwargs["first_key"]
+
+    for layer in model.model.layers:
+        layer.register_forward_pre_hook(record, with_kwargs=True)
+    with torch.no_grad():
+        model(input_ids=torch.arange(2, 42)[None], seq_lens=torch.tensor([11, 29]))
+    expected = [0] * 8 + [1, 2, 3] + [11] * 8 + list(range(12, 33))
+    assert seen[True].tolist() == expected
+    assert seen[False].tolist() == [0] * 11 + [11] * 29
+
+
 class _ThreadCPContext:
     """The context of a context-parallel group whose ranks are threads of this process."""
 
@@ -426,23 +444,25 @@ class _ThreadCPContext:
         return self._rank.value
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
 @pytest.mark.parametrize("cp", [2, 4])
-def test_context_parallel_shards_match_the_row(monkeypatch, cp):
+def test_context_parallel_shards_match_the_row(monkeypatch, cp, device):
     """The ranks of a context-parallel group give the row's logits and gradients. They run as threads, and every
     collective hands the ranks' tensors over directly, so autograd sees one graph and nothing is rounded to BF16:
     a wrong shard boundary, head slice or position would show at full size. The documents start at a shard cut,
-    straddle cuts and end at one, and the routing is replayed."""
+    straddle cuts and end at one, and the routing is replayed. On CUDA the ranks run the Triton attention kernels."""
     config = _text_config(
         num_attention_heads=8, num_key_value_heads=4, swa_num_attention_heads=8, swa_num_key_value_heads=4
     )
-    model = _randomized_model(config).double()
+    dtype = torch.float64 if device == "cpu" else torch.float32
+    model = _randomized_model(config).to(device, dtype)
     torch.manual_seed(0)
-    seq_lens = torch.tensor([24, 39, 1, 8, 24])
+    seq_lens = torch.tensor([24, 39, 1, 8, 24], device=device)
     num_tokens = int(seq_lens.sum())
-    input_ids = torch.randint(2, 300, (1, num_tokens))
+    input_ids = torch.randint(2, 300, (1, num_tokens)).to(device)
     scores = torch.rand(1, num_tokens, model.model.num_layer_visits, config.n_routed_experts)
-    routed_experts = scores.argsort(-1)[..., : config.num_experts_per_tok]
-    weights = torch.randn(num_tokens, config.unpadded_vocab_size, dtype=torch.float64)
+    routed_experts = scores.argsort(-1)[..., : config.num_experts_per_tok].to(device)
+    weights = torch.randn(num_tokens, config.unpadded_vocab_size, dtype=dtype, device=device)
 
     def gradients(logits: torch.Tensor) -> dict[str, torch.Tensor]:
         model.zero_grad()
@@ -635,8 +655,8 @@ def test_bf16_inputs_get_the_fp32_result_rounded_once():
     identical(activation.apply(state, source), activation.apply(state.float(), source.float()).to(bf16))
 
     # Depth mixes, message gates and the attention kernel return FP32.
-    sources, queries = torch.randn(1, num_tokens, 3, hidden_size, dtype=bf16), torch.randn(2, hidden_size, dtype=bf16)
-    mixed = depth_mix(sources, queries)
+    sources, queries = torch.randn(3, 1, num_tokens, hidden_size, dtype=bf16), torch.randn(2, hidden_size, dtype=bf16)
+    mixed = torch.stack(depth_mix(sources, queries))
     gate, fp32_gate = in_bf16_and_fp32(MessageGate(hidden_size, 4, 1e-6), "down_proj")
     gated = gate(state, source, bf16)
     k, v = torch.randn(2, num_tokens, num_heads // 2, hidden_size // num_heads, dtype=bf16)
@@ -645,7 +665,7 @@ def test_bf16_inputs_get_the_fp32_result_rounded_once():
     first_key = torch.arange(num_tokens) - positions
     out, lse = rel_attention(*operands, first_key, 0.35)
     assert mixed.dtype == gated.dtype == out.dtype == lse.dtype == torch.float32
-    identical(mixed, depth_mix(sources.float(), queries.float()))
+    identical(mixed, torch.stack(depth_mix(sources.float(), queries.float())))
     identical(gated, fp32_gate(state.float(), source.float(), bf16))
     fp32_operands = [operand.detach().float().requires_grad_() for operand in operands]
     expected_out, expected_lse = rel_attention(*fp32_operands, first_key, 0.35)

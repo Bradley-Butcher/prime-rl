@@ -61,6 +61,7 @@ from prime_rl.trainer.models.fusions import (
     write_back_loaded_packed_parameters,
 )
 from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
+from prime_rl.trainer.models.inkling2_loop.attention import Inkling2Attention as Inkling2LoopAttention
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
 from prime_rl.trainer.models.layers.lm_head import TokenSupport, inject_prime_lm_head
 from prime_rl.trainer.models.layers.moe import MoE
@@ -1067,6 +1068,10 @@ def setup_model(
         lm_head_chunk_size = config.fused_lm_head_token_chunk_size
 
     inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
+
+    for module in model.modules():
+        if isinstance(module, Inkling2LoopAttention):
+            module.kernel = config.inkling2_loop_attention
 
     apply_quantization(model, config)
 

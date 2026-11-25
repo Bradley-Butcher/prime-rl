@@ -10,6 +10,8 @@ which is what keeps a convolution from reaching into the previous document. Unde
 holds an equal shard of the row, and a convolution reads the tokens before its shard from the rank that holds them.
 """
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -123,29 +125,41 @@ class DynamicShortConv(nn.Module):
         return (total * (2 * kernel_size + 1) ** -0.5).flatten(-2).to(x.dtype)
 
 
-def depth_mix(sources: torch.Tensor, queries: torch.Tensor, source_mask: torch.Tensor | None = None) -> torch.Tensor:
-    """Attend over depth: one softmax mix of the unit-RMS ``sources [1, T, n, H]`` per row of ``queries [m, H]``.
-    ``source_mask [n]`` marks the sources that exist; the others get no weight.
+def depth_mix(
+    sources: Sequence[torch.Tensor], queries: torch.Tensor, source_mask: torch.Tensor | None = None
+) -> tuple[torch.Tensor, ...]:
+    """Attend over depth: one softmax mix of the unit-RMS ``sources``, each ``[1, T, H]``, per row of
+    ``queries [m, H]``. ``source_mask [n]`` marks the sources that exist; the others get no weight.
 
-    Returns FP32 ``[1, T, m, H]``.
+    Returns ``m`` FP32 tensors ``[1, T, H]``. The RMS scale of a source is one number per token, so it is taken out of
+    both sums over ``H``: a score is a reduction of the source itself and a mix one pass over all of them, which a
+    compiled layer fuses with the norms around them. Nothing holds the sources in FP32, or their normed values. The form
+    is ``_mix_sources`` of NVIDIA-NeMo/Automodel pull request 4914 (Apache-2.0, nemo_automodel/components/models/inkling2/
+    layers.py), with a mask over the sources.
     """
-    values = unweighted_rms_norm(sources, DEPTH_MIX_EPS)
-    scores = torch.matmul(values, queries.float().t()).transpose(-1, -2) * values.shape[-1] ** -0.5
-    if source_mask is not None:
-        scores = scores.masked_fill(~source_mask, float("-inf"))
-    return torch.matmul(torch.softmax(scores, dim=-1), values)
+    sources = [source.float() for source in sources]
+    scales = [torch.rsqrt(source.square().mean(-1) + DEPTH_MIX_EPS) for source in sources]
+    mixes = []
+    for query in queries.float().unbind(0):
+        scores = torch.stack([(source * query).sum(-1) * scale for source, scale in zip(sources, scales)], dim=-1)
+        scores = scores * query.shape[-1] ** -0.5
+        if source_mask is not None:
+            scores = scores.masked_fill(~source_mask, float("-inf"))
+        weights = torch.softmax(scores, dim=-1).unbind(-1)
+        terms = [(weight * scale).unsqueeze(-1) * source for weight, scale, source in zip(weights, scales, sources)]
+        mixes.append(sum(terms[1:], terms[0]))
+    return tuple(mixes)
 
 
 def block_sources(
     block_states: torch.Tensor, block_mask: torch.Tensor, *later: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The sources of a depth mix and their mask: the block slots, then the ``later [1, T, H]`` states, in FP32.
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """The sources of a depth mix and their mask: the block slots, then the ``later [1, T, H]`` states.
 
     The decoder passes ``block_states [1, T, slots, H]`` with one slot per block of the whole model and
     ``block_mask [slots]`` marking the finished ones, so that every layer sees the same shapes.
     """
-    sources = torch.cat([block_states.float(), *(state.float().unsqueeze(2) for state in later)], dim=2)
-    return sources, torch.cat([block_mask, block_mask.new_ones(len(later))])
+    return (*block_states.unbind(2), *later), torch.cat([block_mask, block_mask.new_ones(len(later))])
 
 
 class DepthMix(nn.Module):
@@ -157,8 +171,8 @@ class DepthMix(nn.Module):
             torch.zeros(hidden_size) if num_queries == 1 else torch.zeros(num_queries, hidden_size)
         )
 
-    def forward(self, sources: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
-        """``sources [1, T, n, H]``, ``source_mask [n]``. Returns FP32 ``[1, T, num_queries, H]``."""
+    def forward(self, sources: Sequence[torch.Tensor], source_mask: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """``sources`` each ``[1, T, H]``, ``source_mask [n]``. Returns an FP32 ``[1, T, H]`` per query."""
         return depth_mix(sources, self.query.view(-1, self.query.shape[-1]), source_mask)
 
 
@@ -176,8 +190,9 @@ class MessageGate(nn.Module):
     def forward(self, state: torch.Tensor, message: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """Returns FP32."""
         state, message = state.float(), message.float()
-        normed = torch.cat([unweighted_rms_norm(state, self.eps), unweighted_rms_norm(message, self.eps)], dim=-1)
-        hidden = self.down_proj(normed.to(dtype)).float()
+        # Rounded before they are joined: a compiled layer would hold the joined pair in FP32.
+        normed = torch.cat([unweighted_rms_norm(x, self.eps).to(dtype) for x in (state, message)], dim=-1)
+        hidden = self.down_proj(normed).float()
         forget = torch.tanh(hidden @ self.forget_proj.weight.float().t())
         gain = torch.tanh(hidden @ self.message_proj.weight.float().t())
         return (1.0 - forget) * state + gain * message
@@ -194,7 +209,7 @@ class Inkling2FinalNorm(nn.Module):
 
     def forward(self, block_states: torch.Tensor, block_mask: torch.Tensor, current: torch.Tensor) -> torch.Tensor:
         sources, source_mask = block_sources(block_states, block_mask, current)
-        mixed = depth_mix(sources, self.query.unsqueeze(0), source_mask)[:, :, 0]
+        (mixed,) = depth_mix(sources, self.query.unsqueeze(0), source_mask)
         return (unweighted_rms_norm(mixed, self.eps) * self.weight.float()).to(current.dtype)
 
 
