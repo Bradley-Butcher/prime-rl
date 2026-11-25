@@ -8,9 +8,9 @@ being compiled, on weights that lie on the FP8 grid, so that the codes it must g
 
 Not covered here: the model class. ``Inkling2LoopForRL`` builds on vLLM's looped Inkling 2 model and imports only on
 a vLLM that has it. So no case shows which experts its constructor builds for a format, that it refuses an unknown
-format before the model is built, that ``load_weights`` sends both expert tensors of every layer to the rounding and
-reports their scales as loaded, or that the BF16 experts say ``supports_lora = False``. These need a vLLM that has
-the model (on a machine without a GPU it imports with ``CUDA_VISIBLE_DEVICES=""``).
+format before the model is built, or that ``load_weights`` sends both expert tensors of every layer to the rounding
+and reports their scales as loaded. These need a vLLM that has the model (on a machine without a GPU it imports with
+``CUDA_VISIBLE_DEVICES=""``).
 
 Left to GPU checks: the forward of ``Inkling2FP8Experts`` (vLLM's FP8 kernels and its activation op exist only in
 a process with a GPU), what the rounding gives on the serving GPU for trained weights and whether those bytes are

@@ -8,8 +8,9 @@ from torch import nn
 _LORA_PREFIX = "base_layer."
 
 
-def lora_parameter(*shape: int, like: torch.Tensor) -> nn.Parameter:
-    return nn.Parameter(torch.empty(*shape, device=like.device, dtype=like.dtype))
+def lora_parameter(*shape: int, like: torch.Tensor, dtype: torch.dtype | None = None) -> nn.Parameter:
+    """An adapter parameter on ``like``'s device, in ``dtype`` or ``like``'s."""
+    return nn.Parameter(torch.empty(*shape, device=like.device, dtype=dtype or like.dtype))
 
 
 class LoRAModule(nn.Module):
@@ -44,6 +45,11 @@ class LoRAModule(nn.Module):
                 nn.init.kaiming_uniform_(param, a=math.sqrt(5))
             else:
                 nn.init.zeros_(param)
+
+    @property
+    def base_dtype(self) -> torch.dtype:
+        """The adapted weights' dtype, which the adapter is exported in whatever its parameters' dtype."""
+        return next(param.dtype for param in self.base_layer.parameters() if param.is_floating_point())
 
     @abstractmethod
     def adapter_state_dict(self) -> dict[str, torch.Tensor]:

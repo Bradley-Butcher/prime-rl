@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import Field, model_validator
 
-from prime_rl.configs.inference import InferenceConfig, setup_dummy_load
+from prime_rl.configs.inference import InferenceConfig, setup_dummy_load, setup_inference_lora
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.monitors import FileMonitorConfig, PrimeMonitorConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig, SpeculativeDecodingConfig, TrainSamplingConfig
@@ -543,8 +543,7 @@ class RLConfig(BaseConfig):
     def auto_setup_lora(self):
         if self.trainer.model.lora is not None:
             if self.inference is not None:
-                self.inference.vllm.enable_lora = True
-                self.inference.vllm.max_lora_rank = self.trainer.model.lora.rank
+                setup_inference_lora(self.inference, self.trainer.model.lora.rank)
             else:
                 warnings.warn(
                     "LoRA is enabled, but inference is not configured. When manually starting the inference server, "

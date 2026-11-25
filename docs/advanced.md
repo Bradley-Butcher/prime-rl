@@ -48,9 +48,9 @@ layer visit (48), in execution order, and the routing metrics of the looped laye
 visits. Attention is an exact FP32 kernel that scores the queries in chunks of bounded size, so its time, not its
 score memory, grows with the sequence length times the attention span, which is the 1024-token window on 20 of
 the 24 layers. Context parallelism head-shards that kernel (the degree must divide the 24 query and 8 KV heads)
-and passes the three tokens the short convolutions reach across each shard boundary. LoRA is not supported for
-this family, and neither are the `model.compile` modes that record CUDA graphs (`reduce-overhead`,
-`max-autotune`). Weight broadcast is implemented for the filesystem and NCCL transports: the conversion to the
+and passes the three tokens the short convolutions reach across each shard boundary. LoRA adapts its attention
+projections and routed experts (see [LoRA Training](#lora-training)). The `model.compile` modes that record CUDA
+graphs (`reduce-overhead`, `max-autotune`) are not supported. Weight broadcast is implemented for the filesystem and NCCL transports: the conversion to the
 checkpoint layout is not expressible as views, so the NIXL and ModelExpress transports are not available. Without
 context parallelism, full fine-tuning on eight 80 GB GPUs peaks at 56 GiB per GPU for rows of up to 8k tokens and
 at 73 GiB for 16k, and 24k rows run out of memory. The peak follows the tokens a GPU holds: with `cp = 8` it holds
@@ -261,7 +261,42 @@ dropout = 0.0
 
 `target_modules` defaults to a reasonable cross-family set (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `experts`, plus a few latent-projection names for Nemotron). Unknown names are silently ignored, so the defaults work across architectures. Add architecture-specific names to extend coverage (e.g. `in_proj` / `out_proj` for Mamba).
 
+The adapter's parameters take the base layers' dtype (`optimization_dtype`) unless `dtype` sets their own. A bf16 weight drops any Adam step smaller than half a bf16 unit, which at a small learning rate is most of them, so with `optimization_dtype = "bfloat16"` (which halves the memory of the frozen base) set `dtype = "float32"`: the adapter, its gradients and its optimizer state are fp32 while the base stays bf16, the forward still computes in bf16 (FSDP's param dtype), checkpoints keep fp32, and broadcasts cast the adapter to the base dtype.
+
 LoRA is supported across SFT and RL. NCCL weight broadcast is **not** supported with LoRA — the default NCCL transport automatically falls back to filesystem when LoRA is enabled. Broadcast dirs of LoRA runs contain the raw adapter (`adapter_model.safetensors` + `adapter_config.json`). With LoRA on, the inference server registers the adapter under the model name and serves the base model as `<model>-base`.
+
+Inkling 2 Mini takes adapters on its attention projections and its routed experts, which is where vLLM's Inkling 2 serves them. It needs the target names spelled out: the defaults match the `down_proj` of its loop message gates, and a target that vLLM has no adapter for (message gates, depth mixes, convolutions, the router, the embeddings) is refused at startup.
+
+```toml
+[trainer.model]
+optimization_dtype = "bfloat16"
+
+[trainer.model.lora]
+rank = 16
+alpha = 32
+dtype = "float32"
+target_modules = ["q_proj", "k_proj", "v_proj", "rel_proj", "gate_proj", "sink_proj", "o_proj", "experts"]
+
+[weight_broadcast]
+type = "filesystem"
+```
+
+Here `gate_proj` is the attention's output gate. `experts` adapts all three projections of every expert; leave it out for an attention-only adapter. The looped layers have one adapter, which every pass applies. The server is configured by hand (it runs from its own environment, see [the Inkling 2 Mini example](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/examples/advanced/inkling2-mini/README.md)):
+
+```toml
+[weight_broadcast]
+type = "filesystem"
+
+[vllm]
+enable_lora = true
+max_lora_rank = 32
+```
+
+- **`max_lora_rank` is twice `lora.rank` with `experts`.** The checkpoint and vLLM hold an expert's gate and up projections as one weight, so their two adapters are exported as one of twice the rank (`rank_pattern` in `adapter_config.json`). A server with a smaller `max_lora_rank` refuses the adapter. An attention-only adapter needs `lora.rank`.
+- **Leave `lora_target_modules` unset.** With it, vLLM loads an adapter's other modules without an error and serves them without their adapter, so this model's server refuses the setting.
+- **The experts must be served in BF16.** A server with `quantization = "fp8_per_block"` takes attention adapters only and refuses one with experts.
+- **Pick `alpha / rank` a power of two.** vLLM multiplies the scale into `lora_B` in bf16 when it loads an adapter. A power of two is exact; any other scale rounds.
+- **An adapter with experts is large.** At rank 16 it is 1.3 GB on disk per broadcast, and takes 1.6 GB of GPU memory per adapter slot on the server.
 
 ## Disaggregated Prefill/Decode Inference
 

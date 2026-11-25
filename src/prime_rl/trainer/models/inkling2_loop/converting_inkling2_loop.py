@@ -3,8 +3,10 @@
 "Checkpoint" means the names Thinking Machines publish (``model.llm.layers.N.attn.wq_du.weight``, ...), which is
 also what the serving stack loads. The chain runs forward for ``load_dcp_from_hf`` and reversed for the weight
 broadcast. Packed experts are dequantized before the chain (``dequantize.py``) and are never re-packed: the
-reverse direction always emits BF16 experts.
+reverse direction always emits BF16 experts. ``convert_adapter`` gives a LoRA adapter the same names.
 """
+
+import re
 
 import torch
 from torch import Tensor
@@ -13,6 +15,16 @@ from prime_rl.trainer.models.conversion_ops import ConvOp, Rename, StateDict
 from prime_rl.trainer.models.inkling2.converting_inkling2 import InterleavedGateUp
 
 CHECKPOINT_PREFIX = "model.llm."
+# Attention projections, as (checkpoint name, PrimeRL name).
+ATTENTION_PROJECTIONS = (
+    ("wq_du", "q_proj"),
+    ("wk_dv", "k_proj"),
+    ("wv_dv", "v_proj"),
+    ("wr_du", "rel_proj"),
+    ("gate_attn", "gate_proj"),
+    ("attn_sink_proj", "sink_proj"),
+    ("wo_ud", "o_proj"),
+)
 # Loop message gates, as (checkpoint controller name, PrimeRL gate name).
 MESSAGE_STREAMS = (("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
 
@@ -80,13 +92,10 @@ def _layer_ops(layer_idx: int) -> list[ConvOp]:
     prime = f"model.layers.{layer_idx}"
     attn, self_attn = f"{checkpoint}.attn", f"{prime}.self_attn"
     ops: list[ConvOp] = [
-        Rename(f"{attn}.wq_du.weight", f"{self_attn}.q_proj.weight"),
-        Rename(f"{attn}.wk_dv.weight", f"{self_attn}.k_proj.weight"),
-        Rename(f"{attn}.wv_dv.weight", f"{self_attn}.v_proj.weight"),
-        Rename(f"{attn}.wr_du.weight", f"{self_attn}.rel_proj.weight"),
-        Rename(f"{attn}.gate_attn.weight", f"{self_attn}.gate_proj.weight"),
-        Rename(f"{attn}.attn_sink_proj.weight", f"{self_attn}.sink_proj.weight"),
-        Rename(f"{attn}.wo_ud.weight", f"{self_attn}.o_proj.weight"),
+        *(
+            Rename(f"{attn}.{name}.weight", f"{self_attn}.{prime_name}.weight")
+            for name, prime_name in ATTENTION_PROJECTIONS
+        ),
         Rename(f"{attn}.q_l2_clip.scale", f"{self_attn}.q_scale"),
         Rename(f"{attn}.rel_l2_clip.scale", f"{self_attn}.rel_scale"),
         Rename(f"{attn}.rel_logits_proj.proj", f"{self_attn}.rel_table"),
@@ -155,6 +164,62 @@ def conversion_chain(config) -> list[ConvOp]:
     return ops
 
 
+ATTENTION_ADAPTER_RE = re.compile(r"model\.layers\.(\d+)\.self_attn\.(\w+)\.(lora_[AB]\.weight)")
+EXPERT_ADAPTER_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.(lora_[AB])\.weight")
+
+
+def convert_adapter(state_dict: StateDict) -> StateDict:
+    """A LoRA adapter in checkpoint names, as vLLM's Inkling 2 loads it: the attention projections renamed, and each
+    layer's per-expert tensors stacked into one adapter per expert weight, ``lora_A [E, rank, in]`` and
+    ``lora_B [E, out, rank]``. Empties ``state_dict``.
+
+    The gate and up projections train an adapter each, and the checkpoint holds them as one ``w13`` weight with the
+    gate in its even rows and the up in its odd ones. Their adapters therefore become one of twice the rank, whose
+    ``lora_B`` is zero where one projection's rows meet the other's ranks:
+
+        [B_gate 0   ]   [A_gate]
+        [0      B_up] @ [A_up  ]   with the rows interleaved as the weight's
+
+    which is each projection's own delta, at the scale (alpha over rank) of every other module.
+    """
+    prime_to_checkpoint = {prime_name: name for name, prime_name in ATTENTION_PROJECTIONS}
+    converted: StateDict = {}
+    layer_experts: dict[str, dict[tuple[str, str], dict[int, Tensor]]] = {}
+    for key in list(state_dict):
+        if match := ATTENTION_ADAPTER_RE.fullmatch(key):
+            layer, projection, suffix = match.groups()
+            name = f"{CHECKPOINT_PREFIX}layers.{layer}.attn.{prime_to_checkpoint[projection]}.{suffix}"
+            converted[name] = state_dict.pop(key)
+        elif match := EXPERT_ADAPTER_RE.fullmatch(key):
+            layer, expert, projection, matrix = match.groups()
+            experts = layer_experts.setdefault(layer, {}).setdefault((projection, matrix), {})
+            experts[int(expert)] = state_dict.pop(key)
+        else:
+            raise ValueError(f"No checkpoint name for the adapter weight {key}")
+    # One layer's tensors at a time: the stacked copies of all of them would be a second adapter in memory.
+    while layer_experts:
+        layer, tensors = layer_experts.popitem()
+        stacked = {
+            part: torch.stack([experts[expert] for expert in range(len(experts))]) for part, experts in tensors.items()
+        }
+        del tensors
+        gate_b, up_b = stacked["gate", "lora_B"], stacked["up", "lora_B"]
+        num_experts, intermediate_size, rank = gate_b.shape
+        w13_b = gate_b.new_zeros(num_experts, 2 * intermediate_size, 2 * rank)
+        w13_b[:, 0::2, :rank] = gate_b
+        w13_b[:, 1::2, rank:] = up_b
+        prefix = f"{CHECKPOINT_PREFIX}layers.{layer}.mlp.experts"
+        converted |= {
+            f"{prefix}.w13_weight.lora_A.weight": torch.cat(
+                [stacked["gate", "lora_A"], stacked["up", "lora_A"]], dim=1
+            ),
+            f"{prefix}.w13_weight.lora_B.weight": w13_b,
+            f"{prefix}.w2_weight.lora_A.weight": stacked["down", "lora_A"],
+            f"{prefix}.w2_weight.lora_B.weight": stacked["down", "lora_B"],
+        }
+    return converted
+
+
 def is_hf_state_dict(state_dict: dict[str, Tensor]) -> bool:
     return any(name.startswith(CHECKPOINT_PREFIX) for name in state_dict)
 
@@ -165,4 +230,4 @@ def is_prime_state_dict(state_dict: dict[str, Tensor]) -> bool:
     return any(name.endswith("mlp.router.gate.weight") or name == "model.embed_norm.weight" for name in state_dict)
 
 
-__all__ = ["conversion_chain", "is_hf_state_dict", "is_prime_state_dict"]
+__all__ = ["convert_adapter", "conversion_chain", "is_hf_state_dict", "is_prime_state_dict"]

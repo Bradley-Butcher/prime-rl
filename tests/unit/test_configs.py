@@ -1682,6 +1682,24 @@ def test_model_init_scratch_rejects_lora():
         SFTConfig.model_validate({"model": {"init": {"type": "scratch"}, "lora": {}}})
 
 
+@pytest.mark.parametrize("max_lora_rank, expected", [(None, 16), (8, 16), (32, 32)])
+def test_rl_lora_keeps_a_larger_max_lora_rank(max_lora_rank: int | None, expected: int):
+    """Inkling 2 Mini's server needs twice the trainer's rank."""
+    config = RLConfig.model_validate(
+        {
+            "trainer": {"model": {"optimization_dtype": "bfloat16", "lora": {"rank": 16, "dtype": "float32"}}},
+            "orchestrator": {
+                "train": {"source": [{"env": {"taskset": {"id": "reverse-text"}}}]},
+                "renderer": {"name": "qwen3"},
+            },
+            "inference": {"vllm": {"max_lora_rank": max_lora_rank}},
+        }
+    )
+    assert config.trainer.model.lora.dtype == "float32"
+    assert (config.inference.vllm.enable_lora, config.inference.vllm.max_lora_rank) == (True, expected)
+    assert config.weight_broadcast.type == "filesystem"
+
+
 @pytest.mark.parametrize("tokenizer", [None, "Qwen/Qwen3-0.6B"])
 def test_inference_parsers_resolve_from_the_tokenizer_name(tokenizer: str | None):
     data = {

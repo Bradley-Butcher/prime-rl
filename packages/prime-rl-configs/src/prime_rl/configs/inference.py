@@ -811,6 +811,13 @@ class InferenceConfig(BaseConfig):
         return namespace
 
 
+def setup_inference_lora(inference: InferenceConfig, rank: int) -> None:
+    """Serve the trainer's adapters of rank ``rank``. A larger ``max_lora_rank`` stays: Inkling 2 Mini's gate and up
+    projections are served as one adapter of twice the rank."""
+    inference.vllm.enable_lora = True
+    inference.vllm.max_lora_rank = max(rank, inference.vllm.max_lora_rank or 0)
+
+
 MODEL_NAME_DRAFT_METHODS = ("mtp", "dspark")
 
 
