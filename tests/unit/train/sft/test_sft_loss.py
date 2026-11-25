@@ -110,8 +110,7 @@ def test_cross_entropy_kernel_matches_eager_math(monkeypatch, vocab, with_grad):
 @pytest.mark.parametrize("vocab, hidden", [(37, 8), (32002, 100), (201088, 256)])
 @pytest.mark.parametrize("chunk_size", [96, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("softcap", [None, 20.0])
-def test_fused_lm_head_cross_entropy_kernel_matches_eager_math(monkeypatch, vocab, hidden, chunk_size, dtype, softcap):
+def test_fused_lm_head_cross_entropy_kernel_matches_eager_math(monkeypatch, vocab, hidden, chunk_size, dtype):
     """With quack's kernel the chunked head gives the eager math's loss, with and without gradients, and hidden and
     weight gradients."""
     torch.manual_seed(0)
@@ -120,7 +119,7 @@ def test_fused_lm_head_cross_entropy_kernel_matches_eager_math(monkeypatch, voca
     labels[torch.rand(1, 300, device="cuda") < 0.3] = IGNORE_INDEX
     labels[:, :100] = IGNORE_INDEX
     with torch.device("cuda"):
-        lm_head = FusedOutputLinear(hidden, vocab, chunk_size=chunk_size, softcap=softcap)
+        lm_head = FusedOutputLinear(hidden, vocab, chunk_size=chunk_size)
     lm_head.weight = torch.nn.Parameter(torch.randn(vocab, hidden, device="cuda", dtype=dtype) * 3 / hidden**0.5)
 
     def run():

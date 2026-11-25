@@ -164,11 +164,11 @@ class Inkling2DecoderLayer(nn.Module):
         if self.attention_input is None:
             streams = (hidden_states,)
         else:
-            streams = self.attention_input(*block_sources(block_states, block_mask, hidden_states)).unbind(2)
+            streams = self.attention_input(*block_sources(block_states, block_mask, hidden_states))
 
         messages = None
         if message_bank is not None:
-            messages = depth_mix(message_bank, message_queries).unbind(2)
+            messages = depth_mix(message_bank.unbind(2), message_queries)
             streams = tuple(
                 self.message_gates[name](stream, message, dtype)
                 for name, stream, message in zip("qkv", streams * (3 // len(streams)), messages)
@@ -189,7 +189,7 @@ class Inkling2DecoderLayer(nn.Module):
         else:
             residual = hidden_states.float() + attn_output.float()
             mlp_sources = block_sources(block_states, block_mask, residual)
-        mlp_states = self.mlp_input(*mlp_sources)[:, :, 0]
+        (mlp_states,) = self.mlp_input(*mlp_sources)
         if messages is not None:
             mlp_states = self.message_gates["mlp"](mlp_states, messages[3], dtype)
         mlp_output = self.mlp(self.post_attention_layernorm(mlp_states, dtype), routed_experts=routed_experts)
@@ -228,8 +228,8 @@ class Inkling2LoopPreTrainedModel(PreTrainedModelPrimeRL):
     @classmethod
     def cuda_graph_blocker(cls, config) -> str | None:
         return (
-            "the attention kernel plans its query chunks from the row's document layout on the host, which a CUDA "
-            "graph cannot record"
+            "the dense attention kernel plans its query chunks from the row's document layout on the host, which a "
+            "CUDA graph cannot record, and the Triton kernels have not been run in one"
         )
 
     @classmethod

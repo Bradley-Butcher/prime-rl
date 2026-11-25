@@ -423,6 +423,9 @@ class ModelConfig(BaseModelConfig):
     dsv4_compressor_backend: Literal["cudnn", "torch"] = "cudnn"
     """Backend of the DeepSeek V4 compressors' softmax-gated pooling. ``cudnn`` (default) runs the cuDNN frontend's fused CSA/HCA compressor where its kernels apply: an SM100 or newer GPU, bf16 activations, and a compress rate of 2 or 4, or 128 with head_dim 128 or 512. Elsewhere it silently runs the torch ops, so on SM90 GPUs such as the H100 and H200 ``cudnn`` runs torch. ``cudnn`` scans each entry's document list, so it wins on rows of few long documents and loses to the flat torch ops on rows of many short documents. ``torch`` always runs the torch ops."""
 
+    inkling2_loop_attention: Literal["auto", "dense", "triton"] = "auto"
+    """Attention kernel of Inkling 2 Mini. ``triton`` runs Triton tiles with FP32 scores and sums and BF16 products. ``dense`` runs the FP32 reference, which holds the materialized relative bias and is far slower (25 to 50 times on an RTX 4000 Ada). ``auto`` (default) runs ``triton`` on CUDA and ``dense`` on CPU."""
+
     freeze_moe_router: bool | Literal["auto"] = "auto"
     """Freeze MoE router gate parameters. ``auto`` (default): ``True`` for RL, ``False`` for SFT; a no-op on non-MoE models. Frozen routers get no optimizer state, so resuming a checkpoint saved with a frozen router with ``freeze_moe_router=false`` fails on missing DCP keys."""
 

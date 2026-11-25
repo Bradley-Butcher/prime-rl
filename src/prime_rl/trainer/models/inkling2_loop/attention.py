@@ -1,9 +1,13 @@
 """Inkling 2 attention: grouped-query attention with a per-query relative bias, a per-token sink and an output gate.
 
 The score of query ``i`` on key ``j`` is ``scale * q_i . k_j + rel[i, h, i - j]``, where the relative bias reaches
-back ``rel_extent`` tokens and is zero beyond. No flash-attention kernel carries that bias and its gradient, so
-the core is computed densely in FP32, in query chunks, with a backward that recomputes each chunk instead of
-keeping the score matrices.
+back ``rel_extent`` tokens and is zero beyond. No flash-attention kernel carries that bias and its gradient. Two
+kernels compute it:
+
+- ``rel_attention``, the reference: dense and in FP32, in query chunks, with a backward that recomputes each chunk
+  instead of keeping the score matrices. It takes the materialized bias ``[T, heads, rel_extent]``.
+- ``tiled_rel_attention``: Triton tiles (``kernels/inkling2_attention.py``) with FP32 scores, softmax and sums and
+  products in the operands' dtype. It takes the relative states and the table. The default on CUDA.
 
 Under context parallelism the kernel runs head-sharded (Ulysses): an all-to-all gives each rank the whole row for
 its share of the heads, and a second one returns the outputs to the sequence shards. The kernel itself is unchanged.
@@ -11,9 +15,11 @@ its share of the heads, and a second one returns the outputs to the sequence sha
 
 import bisect
 import math
+from typing import Literal
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from prime_rl.trainer.models.inkling2_loop.configuration_inkling2_loop import (
     SLIDING_ATTENTION,
@@ -219,12 +225,108 @@ def rel_attention(
     return _rel_attention(q, k, v, rel, first_key, scale)
 
 
+@torch.library.custom_op("prime_rl_attn::inkling2_tiled_attention", mutates_args=())
+def _tiled_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_states: torch.Tensor,
+    rel_table: torch.Tensor,
+    first_key: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from prime_rl.trainer.models.kernels.inkling2_attention import attention_forward
+
+    return attention_forward(q, k, v, rel_states, rel_table, first_key, scale)
+
+
+@_tiled_attention.register_fake
+def _(q, k, v, rel_states, rel_table, first_key, scale):
+    return q.new_empty(q.shape, dtype=torch.float32), q.new_empty(q.shape[:2], dtype=torch.float32)
+
+
+@torch.library.custom_op("prime_rl_attn::inkling2_tiled_attention_backward", mutates_args=())
+def _tiled_attention_backward(
+    grad_out: torch.Tensor,
+    grad_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_states: torch.Tensor,
+    rel_table: torch.Tensor,
+    first_key: torch.Tensor,
+    scale: float,
+    table_needs_grad: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from prime_rl.trainer.models.kernels.inkling2_attention import attention_backward
+
+    return attention_backward(
+        grad_out, grad_lse, out, lse, q, k, v, rel_states, rel_table, first_key, scale, table_needs_grad
+    )
+
+
+@_tiled_attention_backward.register_fake
+def _(grad_out, grad_lse, out, lse, q, k, v, rel_states, rel_table, first_key, scale, table_needs_grad):
+    grad_table = rel_table.new_empty(rel_table.shape if table_needs_grad else (0,))
+    return (*(torch.empty_like(x) for x in (q, k, v, rel_states)), grad_table)
+
+
+def _tiled_attention_setup_context(ctx, inputs, output) -> None:
+    *tensors, scale = inputs
+    ctx.save_for_backward(*tensors, *output)
+    ctx.scale = scale
+
+
+def _tiled_attention_autograd(ctx, grad_out: torch.Tensor | None, grad_lse: torch.Tensor | None):
+    q, k, v, rel_states, rel_table, first_key, out, lse = ctx.saved_tensors
+    if grad_out is None:
+        grad_out = torch.zeros_like(out)
+    if grad_lse is None:
+        grad_lse = torch.zeros_like(lse)
+    table_needs_grad = ctx.needs_input_grad[4]
+    *grads, grad_table = _tiled_attention_backward(
+        grad_out, grad_lse, out, lse, q, k, v, rel_states, rel_table, first_key, ctx.scale, table_needs_grad
+    )
+    return *grads, grad_table if table_needs_grad else None, None, None
+
+
+_tiled_attention.register_autograd(_tiled_attention_autograd, setup_context=_tiled_attention_setup_context)
+
+
+def tiled_rel_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_states: torch.Tensor,
+    rel_table: torch.Tensor,
+    first_key: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rel_attention`` with the bias ``rel[i, h] = rel_states[i, h] @ rel_table`` (``[T, Hq, F]`` and ``[F, E]``),
+    which it never holds for all heads at once. All five operands are BF16 or all FP32, on a CUDA device. BF16 operands
+    get BF16 products: of the scores, of the bias, and of the probabilities and their gradients rounded to BF16."""
+    head_dim = q.shape[-1]
+    # The kernels' tiles are a power of two wide, at least 16. Zero channels change no product.
+    padding = max(16, 1 << (head_dim - 1).bit_length()) - head_dim
+    if padding:
+        q, k, v = (F.pad(x, (0, padding)) for x in (q, k, v))
+    out, lse = _tiled_attention(q, k, v, rel_states, rel_table, first_key, scale)
+    return (out[..., :head_dim], lse) if padding else (out, lse)
+
+
+AttentionKernel = Literal["auto", "dense", "triton"]
+
+
 class Inkling2Attention(nn.Module):
     """One attention layer. Sliding layers see ``sliding_window_size`` keys and run static K/V convolutions; full
     layers see their whole document, scale queries and relative states with the log of the position, and run K/V
     convolutions whose taps depend on the token."""
 
     cp_context: CPContext = CPContext()
+    # ``auto`` runs the Triton kernels on CUDA and the dense reference elsewhere.
+    kernel: AttentionKernel = "auto"
 
     def __init__(self, config: Inkling2LoopTextConfig, layer_idx: int, num_visits: int) -> None:
         super().__init__()
@@ -310,8 +412,14 @@ class Inkling2Attention(nn.Module):
             q, k, v, rel_states = (
                 _all_to_all_seq_to_head(states, cp.cp_world_size, cp.cp_group) for states in (q, k, v, rel_states)
             )
-        rel = torch.matmul(rel_states, self.rel_table.to(dtype))
-        out, lse = rel_attention(q, k, v, rel, first_key, self.scaling)
+        rel_table = self.rel_table.to(dtype)
+        if self.kernel == "triton" or (
+            self.kernel == "auto" and q.device.type == "cuda" and dtype in (torch.bfloat16, torch.float32)
+        ):
+            out, lse = tiled_rel_attention(q, k, v, rel_states, rel_table, first_key, self.scaling)
+        else:
+            rel = torch.matmul(rel_states, rel_table)
+            out, lse = rel_attention(q, k, v, rel, first_key, self.scaling)
         if cp.cp_enabled:
             out = _all_to_all_head_to_seq(out, cp.cp_world_size, cp.cp_group)
             lse = _all_to_all_head_to_seq(lse.unsqueeze(-1), cp.cp_world_size, cp.cp_group).squeeze(-1)
@@ -322,4 +430,4 @@ class Inkling2Attention(nn.Module):
         return self.o_proj(out.reshape(1, num_tokens, -1).to(dtype))
 
 
-__all__ = ["Inkling2Attention", "rel_attention"]
+__all__ = ["AttentionKernel", "Inkling2Attention", "rel_attention", "tiled_rel_attention"]
