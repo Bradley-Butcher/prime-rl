@@ -45,9 +45,10 @@ Inkling 2 Mini trains from the release checkpoint: its NVFP4 and MXFP8 routed ex
 when the trainer first loads it. `tools/convert_inkling2_loop_to_bf16.py` writes the same BF16 weights as a checkpoint.
 The decoder runs layers 6-17 three times with shared weights, so router replay takes one `routed_experts` row per
 layer visit (48), in execution order, and the routing metrics of the looped layers are pooled over their three
-visits. Attention is an exact FP32 kernel that scores the queries in chunks of bounded size, so its time, not its
-score memory, grows with the sequence length times the attention span, which is the 1024-token window on 20 of
-the 24 layers. Context parallelism head-shards that kernel (the degree must divide the 24 query and 8 KV heads)
+visits. Attention runs Triton kernels on CUDA (`model.inkling2_loop_attention`: FP32 scores and sums, BF16 products),
+whose time, not score memory, grows with the sequence length times the attention span, which is the 1024-token window
+on 20 of the 24 layers; `dense` is the exact FP32 reference, far slower. Context parallelism head-shards the kernel
+(the degree must divide the 24 query and 8 KV heads)
 and passes the three tokens the short convolutions reach across each shard boundary. LoRA adapts its attention
 projections and routed experts (see [LoRA Training](#lora-training)). The `model.compile` modes that record CUDA
 graphs (`reduce-overhead`, `max-autotune`) are not supported. Weight broadcast is implemented for the filesystem and NCCL transports: the conversion to the
