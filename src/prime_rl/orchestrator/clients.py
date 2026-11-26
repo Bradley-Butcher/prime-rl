@@ -62,6 +62,7 @@ class PrefillScorer:
 # dropped, which bounds how long a slow router can delay episode completion.
 SESSION_RELEASE_CONCURRENCY = 32
 SESSION_RELEASE_QUEUE_TIMEOUT_S = 30.0
+STALL_CHECK_TIMEOUT_S = 5.0
 
 
 class InferenceClient:
@@ -99,6 +100,23 @@ class InferenceClient:
         self.sessions_released = 0
         self.session_releases_failed = 0
         self.model_name = model_name
+        self._client_config = client_config
+        self._stall_client: AsyncClient | None = None
+
+    async def inference_stalled(self) -> bool | None:
+        """Whether the endpoint says it is stalled (the Tinker bridge's ``GET /stall``): True while it does, or while
+        it cannot be reached; None where it has no such route."""
+        if self._stall_client is None:
+            self._stall_client = setup_admin_clients(self._client_config)[0]
+        try:
+            response = await self._stall_client.get("/stall", timeout=httpx.Timeout(STALL_CHECK_TIMEOUT_S))
+        except httpx.HTTPError:
+            return True
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            return True
+        return bool(response.json().get("stalled"))
 
     async def score(self, token_ids: list[int]) -> list[float]:
         """Prefill-score ``token_ids`` under this endpoint's model (one logprob
@@ -109,6 +127,8 @@ class InferenceClient:
         await self._scorer.aclose()
         if self._session_client is not None:
             await self._session_client.aclose()
+        if self._stall_client is not None:
+            await self._stall_client.aclose()
 
     async def finish_sessions(self, session_ids: list[str]) -> None:
         """Release completed sessions when the client-facing router supports it."""

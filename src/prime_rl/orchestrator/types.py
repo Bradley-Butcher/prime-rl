@@ -36,7 +36,7 @@ class Progress:
 
 WorkKind = Literal["train", "eval"]
 
-CancelReason = Literal["overload", "superseded", "shutdown"]
+CancelReason = Literal["overload", "superseded", "shutdown", "stall"]
 
 
 @dataclass
@@ -44,7 +44,7 @@ class GroupCancellation:
     """Terminal marker for a dropped group: one message covering every episode
     the group still owed the sink (in-flight and never-dispatched), so
     count-to-``group_size`` finalization still fires. ``reason`` distinguishes
-    pipeline decisions (overload cut, superseded eval, shutdown) from episode errors."""
+    pipeline decisions (overload cut, superseded eval, shutdown, an inference stall) from episode errors."""
 
     kind: WorkKind
     env_name: str
