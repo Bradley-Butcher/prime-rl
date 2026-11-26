@@ -136,7 +136,7 @@ class PassTurnsPenaltyConfig(BaseConfig):
     env reward is positive and that the ``unfinished`` lever leaves to the env's score; with ``t`` its model turns
     (``Trace.num_turns``, every sampled reply across the conversation) and ``t_min``, ``t_max`` the fewest and most of
     the group's passes, its reward is multiplied by ``1 - weight * (t - t_min) / (t_max - t_min)``: the quickest pass
-    keeps its reward, the slowest keeps ``1 - weight``. A group with fewer than two passes, or whose passes took as
+    keeps its reward, the slowest keeps ``1 - weight`` (``free`` gives turns of slack). A group with fewer than two passes, or whose passes took as
     many turns, is unchanged, and a failure is never changed, so there is nothing for a failure to gain. The group is
     the one the baseline is taken over: a down-sampled group's every rollout under ``baseline = "all"``, its kept
     rollouts under ``"kept"``. Off while ``weight`` is 0."""
@@ -144,6 +144,11 @@ class PassTurnsPenaltyConfig(BaseConfig):
     weight: float = Field(0.0, ge=0, lt=1, allow_inf_nan=False)
     """The share of its reward the group's slowest pass loses. 0 turns the penalty off. Below 1, so every pass keeps a
     positive reward and still beats every failure."""
+
+    free: int = Field(0, ge=0)
+    """Turns past the group's quickest pass a pass takes without penalty, so that a turn or two of noise marks nothing
+    down: with it, a pass is cut by ``weight * (t - t_min - free) / (t_max - t_min - free)``, none within ``free`` of
+    ``t_min``, and a group whose passes span ``free`` turns or fewer is unchanged."""
 
     gate_on_raw: bool = True
     """The admission gates judge a group by its advantages without this penalty, so it never decides whether a group
@@ -153,9 +158,10 @@ class PassTurnsPenaltyConfig(BaseConfig):
 
     def factor(self, turns: int, fewest: int, most: int) -> float:
         """What a pass's reward is multiplied by for ``turns``, its group's passes taking ``fewest`` to ``most``."""
-        if most <= fewest:
+        spread = most - fewest - self.free
+        if spread <= 0:
             return 1.0
-        return 1.0 - self.weight * (turns - fewest) / (most - fewest)
+        return 1.0 - self.weight * max(0, turns - fewest - self.free) / spread
 
 
 class RewardShapingConfig(BaseConfig):

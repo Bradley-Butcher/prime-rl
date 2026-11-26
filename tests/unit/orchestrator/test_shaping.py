@@ -375,6 +375,29 @@ def test_by_default_the_gate_judges_a_group_without_the_turn_penalty(gate_on_raw
                 assert trained_advantage(sample) == pytest.approx(advantage, abs=1e-6)
 
 
+def test_free_turns_mark_nothing_down_within_them_and_the_slowest_pass_still_loses_the_weight():
+    turns = PassTurnsPenaltyConfig(weight=0.5, free=2)
+    assert [turns.factor(count, 10, 14) for count in (10, 11, 12, 13, 14)] == pytest.approx([1, 1, 1, 0.75, 0.5])
+    assert [turns.factor(count, 10, 12) for count in (10, 11, 12)] == [1.0, 1.0, 1.0]  # a spread within free
+    assert PassTurnsPenaltyConfig(weight=0.5).factor(11, 10, 11) == 0.5  # without free, one turn is the whole weight
+
+
+def test_with_the_gate_on_the_penalty_an_all_pass_group_trains_on_turns_past_free_alone():
+    shaping = {"pass_turns": {"weight": 0.5, "gate_on_raw": False, "free": 2}}
+    algorithm = GRPOAlgorithm(GRPOAlgoConfig(shaping=shaping), None)
+    groups = {
+        "passes a turn or two apart": [rollout(1.0, turns=turns, group="n") for turns in (10, 11, 12)],
+        "passes past free": [rollout(1.0, turns=turns, group="f") for turns in (10, 12, 14)],
+    }
+
+    _, trained = gated(algorithm, groups)
+
+    assert trained == {"passes past free"}
+    # Rewards 1, 1 and 0.5: the quickest two within free of each other.
+    advantages = [episode.traces[0].nodes[1].advantages[0] for episode in groups["passes past free"]]
+    assert advantages == pytest.approx([1 / 6, 1 / 6, -1 / 3], abs=1e-6)
+
+
 def downsampled(directory, baseline: str) -> tuple[TrainSink, TrainSource]:
     """A train sink over env ``a`` rolling out 12 rollouts a Task and training 8, with the zero-advantage gate, the
     curriculum records and live shaping, the turn penalty at 0.5."""
@@ -448,7 +471,10 @@ def test_the_turn_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tm
     # groups.jsonl counts the passes the penalty changed over all twelve. The twelve passes differ only in turns: the
     # gate judges them without the penalty, so they do not train.
     mixed, uniform = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
-    assert (mixed["pass_turns_penalized"], mixed["shaping"]["pass_turns"]) == (5, {"weight": 0.5, "gate_on_raw": True})
+    assert (mixed["pass_turns_penalized"], mixed["shaping"]["pass_turns"]) == (
+        5,
+        {"weight": 0.5, "free": 0, "gate_on_raw": True},
+    )
     assert mixed["kept"] == {"rollouts": 8, "reward": 0.5, "successes": 4}
     assert (uniform["pass_turns_penalized"], uniform["kept"]) == (11, None)
     records = [json.loads(line) for line in (tmp_path / "downsample.jsonl").read_text().splitlines()]
@@ -473,7 +499,7 @@ def test_the_turn_penalty_is_set_live_from_a_step_on_as_the_other_levers_are(tmp
     posted = client.post("/v1/shaping", json={"step": "next", "author": "me", "note": "slow passes", **TURNS_ON})
     assert posted.status_code == 200
     assert (posted.json()["step"], posted.json()["change"], posted.json()["state"]) == (2, TURNS_ON, "pending")
-    on = {"weight": 0.2, "gate_on_raw": True}
+    on = {"weight": 0.2, "free": 0, "gate_on_raw": True}
     assert posted.json()["shaping"] == [{"envs": ["a"], **DEFAULT, "pass_turns": on}]
     source.next_task(step=2)
     source.next_task(step=3)
