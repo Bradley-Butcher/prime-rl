@@ -220,7 +220,23 @@ class AdvRangeGateConfig(BaseConfig):
         return self
 
 
-AdmissionGateConfig: TypeAlias = AdvRangeGateConfig
+class RewardRangeGateConfig(BaseConfig):
+    type: Literal["reward_range"] = "reward_range"
+
+    min_mean_reward: float = 0.0
+    max_mean_reward: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.min_mean_reward > self.max_mean_reward:
+            raise ValueError("min_mean_reward must be less than or equal to max_mean_reward")
+        return self
+
+
+AdmissionGateConfig: TypeAlias = Annotated[
+    AdvRangeGateConfig | RewardRangeGateConfig,
+    Field(discriminator="type"),
+]
 
 
 class CurriculumConfig(BaseConfig):

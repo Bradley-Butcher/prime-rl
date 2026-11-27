@@ -12,10 +12,12 @@ from prime_rl.configs.orchestrator import (
     CurriculumConfig,
     DifficultyPoolConfig,
     DifficultyPoolSamplerConfig,
+    RewardRangeGateConfig,
 )
 from prime_rl.orchestrator.curriculum import (
     AdvRangeGate,
     Curriculum,
+    RewardRangeGate,
     StandardSampler,
 )
 from prime_rl.orchestrator.train_source import TrainSource
@@ -205,6 +207,43 @@ def test_advantage_range_gate_generalizes_zero_advantage_rejection() -> None:
 
     positive_gate = AdvRangeGate(AdvRangeGateConfig(reject_min=0.5, reject_max=0.5))
     assert positive_gate.admit(make_rollout(task, advantages=[0.5])) is False
+
+
+def test_reward_range_gate_band_pass() -> None:
+    task = make_task(0)
+    gate = RewardRangeGate(RewardRangeGateConfig(min_mean_reward=0.12, max_mean_reward=0.88))
+
+    def group_of(passes: int, total: int = 16) -> list[vf.Episode]:
+        return [
+            make_rollout(task, reward=1.0 if i < passes else 0.0, advantages=[0.5 if i < passes else -0.5])[0]
+            for i in range(total)
+        ]
+
+    assert gate.admit(group_of(0)) is False
+    assert gate.admit(group_of(1)) is False
+    assert gate.admit(group_of(2)) is True
+    assert gate.admit(group_of(8)) is True
+    assert gate.admit(group_of(14)) is True
+    assert gate.admit(group_of(15)) is False
+    assert gate.admit(group_of(16)) is False
+
+    # Config parsing via discriminated union and composition with AdvRangeGate in Curriculum
+    cfg = CurriculumConfig.model_validate(
+        {
+            "gates": {
+                "zero_advantage": {"type": "advantage_range", "reject_min": 0.0, "reject_max": 0.0},
+                "reward_band": {"type": "reward_range", "min_mean_reward": 0.12, "max_mean_reward": 0.88},
+            }
+        }
+    )
+    curriculum = Curriculum(cfg, [task])
+    assert curriculum.on_result(group_of(1)) is False
+    assert curriculum.on_result(group_of(15)) is False
+    assert curriculum.on_result(group_of(2)) is True
+    assert curriculum.on_result(group_of(14)) is True
+
+    with pytest.raises(ValueError, match="min_mean_reward"):
+        RewardRangeGateConfig(min_mean_reward=0.9, max_mean_reward=0.1)
 
 
 def keys(tasks: list[vf.Task]) -> list[str]:

@@ -28,9 +28,10 @@ class Curriculum:
             AdvRangeGateConfig,
             CurriculumConfig,
             DifficultyPoolSamplerConfig,
+            RewardRangeGateConfig,
             StandardSamplerConfig,
         )
-        from prime_rl.orchestrator.curriculum.gates import AdvRangeGate
+        from prime_rl.orchestrator.curriculum.gates import AdvRangeGate, RewardRangeGate
         from prime_rl.orchestrator.curriculum.samplers import DifficultyPoolSampler, StandardSampler
 
         config = CurriculumConfig() if config is None else config
@@ -46,6 +47,8 @@ class Curriculum:
         for name, gate_config in config.gates.items():
             if isinstance(gate_config, AdvRangeGateConfig):
                 gate: AdmissionGate = AdvRangeGate(gate_config)
+            elif isinstance(gate_config, RewardRangeGateConfig):
+                gate = RewardRangeGate(gate_config)
             else:
                 raise TypeError(f"Unsupported admission gate config: {type(gate_config).__name__}")
             self.gates[name] = gate
