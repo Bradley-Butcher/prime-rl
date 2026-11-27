@@ -236,7 +236,7 @@ class TrainSink(Reconfigurable):
     async def cancel(self, cancellation: GroupCancellation) -> TrainBatch | None:
         """Process a dropped group's terminal marker: its ``count`` completes
         the group's episode accounting so finalization still fires. A
-        ``shutdown`` drop also voids the group's already-arrived episodes in
+        ``shutdown`` or ``stall`` drop also voids the group's already-arrived episodes in
         ``process_group``."""
         self.pending_group_cancellations[cancellation.group_id] = cancellation
         if not self._group_complete(cancellation.group_id, cancellation.env_name):
@@ -358,9 +358,10 @@ class TrainSink(Reconfigurable):
         # a pipeline decision is not a task result. The group stays open, so a
         # resume re-runs it. So does a down-sampled group an overload cut: what
         # came back is its fastest rollouts, not the whole group its subset is
-        # to be chosen from.
+        # to be chosen from. So does an inference stall's (stall.py), whatever the source: its
+        # rollouts met the server's pause, not the policy's, and the rest are the group's fastest.
         downsampled = getattr(env.config, "downsample", None) is not None
-        voiding = ("shutdown", "overload") if downsampled else ("shutdown",)
+        voiding = ("shutdown", "stall", "overload") if downsampled else ("shutdown", "stall")
         if cancellation is not None and cancellation.reason in voiding:
             if cancellation.reason != "shutdown":
                 self._close([group_id])

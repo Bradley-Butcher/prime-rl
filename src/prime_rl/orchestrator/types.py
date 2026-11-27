@@ -36,7 +36,7 @@ class Progress:
 
 WorkKind = Literal["train", "eval"]
 
-CancelReason = Literal["overload", "superseded", "shutdown"]
+CancelReason = Literal["overload", "superseded", "shutdown", "stall"]
 
 
 @dataclass
@@ -44,7 +44,7 @@ class GroupCancellation:
     """Terminal marker for a dropped group: one message covering every episode
     the group still owed the sink (in-flight and never-dispatched), so
     count-to-``group_size`` finalization still fires. ``reason`` distinguishes
-    pipeline decisions (overload cut, superseded eval, shutdown) from episode errors."""
+    pipeline decisions (overload cut, superseded eval, shutdown, an inference stall) from episode errors."""
 
     kind: WorkKind
     env_name: str
@@ -133,6 +133,8 @@ class GroupState:
     emitted: int = 0
     policy_version_at_start: int = 0
     group_id: uuid.UUID | None = None
+    stall_reruns: int = 0
+    """Rollouts of an eval group run again because they met an inference stall (``stall.py``)."""
 
 
 @dataclass
