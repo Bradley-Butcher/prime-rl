@@ -590,7 +590,9 @@ def test_unfinished_only_with_a_pass_leaves_a_group_without_one_to_the_env_s_sco
         rollout(0.0, turns=9, stop="max_turns"),
         rollout(1.0, turns=9, stop="max_turns"),
     ]
-    assert shaped(on, with_pass) == shaped(off, with_pass) == [(1.0, ()), (0.0, ()), (-0.25, ("unfinished",)), (1.0, ())]
+    assert (
+        shaped(on, with_pass) == shaped(off, with_pass) == [(1.0, ()), (0.0, ()), (-0.25, ("unfinished",)), (1.0, ())]
+    )
 
 
 def test_downsample_uses_shaped_advantages_to_keep_turn_extremes_on_all_pass_groups(tmp_path):
@@ -610,7 +612,9 @@ def test_downsample_uses_shaped_advantages_to_keep_turn_extremes_on_all_pass_gro
         GRPOAlgoConfig(shaping={"pass_turns": {"weight": 0.5, "gate_on_raw": False}}),
         None,
     )
-    config = SimpleNamespace(group_size=8, rollouts_per_task=12, downsample=DownsampleConfig(rollouts=12, baseline="kept"))
+    config = SimpleNamespace(
+        group_size=8, rollouts_per_task=12, downsample=DownsampleConfig(rollouts=12, baseline="kept")
+    )
     sink = TrainSink(
         OrchestratorConfig(batch_size=100),
         tokenizer=None,
