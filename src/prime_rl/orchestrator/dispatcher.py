@@ -27,7 +27,8 @@
   policy version they started with. Online evals may explicitly cancel them
   when a newer checkpoint is ready.
 - An inference stall (``stall.py``) voids the train group of the rollout that
-  met it and holds all dispatch until the inference server answers again.
+  met it, runs an eval rollout that met it again, and holds all dispatch until
+  the inference server answers again.
 """
 
 from __future__ import annotations
@@ -51,7 +52,15 @@ from prime_rl.orchestrator import live
 from prime_rl.orchestrator.clients import InferenceClient
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.eval_source import EvalSource
-from prime_rl.orchestrator.stall import STALL_HOLD_S, STALL_POLL_S, episode_stalled, exception_stalled
+from prime_rl.orchestrator.stall import (
+    MAX_EVAL_STALL_RERUNS,
+    STALL_HOLD_S,
+    STALL_POLL_S,
+    episode_stalled,
+    exception_stalled,
+    stall_building,
+    timed_out,
+)
 from prime_rl.orchestrator.train_source import TrainSource
 from prime_rl.orchestrator.types import (
     CancelReason,
@@ -259,6 +268,9 @@ class Dispatcher:
         self.stall_poll_s = STALL_POLL_S
         self.stall_hold_s = STALL_HOLD_S
         self.stalls = 0
+        # Rollouts its deadline stopped that met a stall, and eval rollouts run again for one
+        self.stall_timeouts = 0
+        self.eval_stall_reruns = 0
 
         self.stopped = asyncio.Event()
         self.task: asyncio.Task | None = None
@@ -731,8 +743,7 @@ class Dispatcher:
         exc = task.exception()
         if isinstance(exc, Exception) and exception_stalled(exc):
             self.hold_for_stall(meta)
-            if meta.kind == "train":
-                await self.drop_group(meta.group_id, reason="stall", arrived=meta)
+            if await self.void_for_stall(meta, group):
                 return
         if isinstance(exc, Exception):
             get_logger().warning(f"Environment request failed in group {meta.group_id} ({meta.env_name}): {exc!r}")
@@ -757,11 +768,9 @@ class Dispatcher:
             )
             return
         episode: vf.WireEpisode = task.result()
-        if episode_stalled(episode):
-            self.hold_for_stall(meta)
-            if meta.kind == "train":
+        if await self.met_stall(meta, episode):
+            if await self.void_for_stall(meta, group):
                 self._release_episodes([episode])
-                await self.drop_group(meta.group_id, reason="stall", arrived=meta)
                 return
 
         if meta.kind == "train":
@@ -790,6 +799,47 @@ class Dispatcher:
         if self.on_episode_complete is not None and meta.started_at > 0:
             self.on_episode_complete(episode.num_total_tokens, meta.calls)
         await self.emit_episode(meta, group, episode)
+
+    async def met_stall(self, meta: InflightEpisode, episode: vf.WireEpisode) -> bool:
+        """Whether the episode met an inference stall: a model call of it failed as one, or its agent's deadline
+        stopped it while the server was stalled, or quiet long enough that one was building (``stall.py``). Holds
+        dispatch while the server says it is stalled."""
+        if episode_stalled(episode):
+            self.hold_for_stall(meta)
+            return True
+        if not timed_out(episode) or self.policy_clients is None:
+            return False
+        state = await self.policy_clients.stall_state()
+        if not stall_building(state):
+            return False
+        assert state is not None
+        self.stall_timeouts += 1
+        get_logger().warning(
+            f"A {meta.kind} rollout of {meta.env_name} ran out its deadline while the inference server was stalled or "
+            f"quiet for {state.get('quiet_s')} s (group {meta.group_id}): it met the stall, not the policy"
+        )
+        if state.get("stalled"):
+            self.hold_for_stall(meta)
+        return True
+
+    async def void_for_stall(self, meta: InflightEpisode, group: GroupState | None) -> bool:
+        """A rollout met an inference stall: its train group is void, and an eval rollout is run again once the server
+        answers, until its group has been run again ``MAX_EVAL_STALL_RERUNS`` times a rollout. Whether it was either;
+        if not, the rollout is kept as it came back."""
+        if meta.kind == "train":
+            await self.drop_group(meta.group_id, reason="stall", arrived=meta)
+            return True
+        if group is None or group.stall_reruns >= MAX_EVAL_STALL_RERUNS * group.target_episodes:
+            return False
+        group.stall_reruns += 1
+        group.episodes_to_schedule += 1
+        self.eval_stall_reruns += 1
+        get_logger().info(
+            f"An eval rollout of {meta.env_name} met an inference stall: it runs again once the server answers "
+            f"(group {meta.group_id}, {self.eval_stall_reruns} so far)"
+        )
+        self.switch_mode(DispatcherMode.PREFER_EVAL, reason="an eval rollout met an inference stall and runs again")
+        return True
 
     def hold_for_stall(self, meta: InflightEpisode) -> None:
         """An episode met an inference stall: hold dispatch until the server says it answers again."""
@@ -1027,4 +1077,6 @@ class Dispatcher:
             "dispatcher/mode": float(self.mode == DispatcherMode.PREFER_EVAL),
             "dispatcher/inference_stalled": float(not self.inference_ok.is_set()),
             "dispatcher/stalls": float(self.stalls),
+            "dispatcher/stall_timeouts": float(self.stall_timeouts),
+            "dispatcher/eval_stall_reruns": float(self.eval_stall_reruns),
         }

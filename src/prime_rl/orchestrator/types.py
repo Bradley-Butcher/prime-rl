@@ -133,6 +133,8 @@ class GroupState:
     emitted: int = 0
     policy_version_at_start: int = 0
     group_id: uuid.UUID | None = None
+    stall_reruns: int = 0
+    """Rollouts of an eval group run again because they met an inference stall (``stall.py``)."""
 
 
 @dataclass

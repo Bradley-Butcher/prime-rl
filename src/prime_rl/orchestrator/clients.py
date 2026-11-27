@@ -103,20 +103,27 @@ class InferenceClient:
         self._client_config = client_config
         self._stall_client: AsyncClient | None = None
 
-    async def inference_stalled(self) -> bool | None:
-        """Whether the endpoint says it is stalled (the Tinker bridge's ``GET /stall``): True while it does, or while
-        it cannot be reached; None where it has no such route."""
+    async def stall_state(self) -> dict | None:
+        """What the endpoint says of its upstream (the Tinker bridge's ``GET /stall``): ``stalled``, and ``quiet_s``,
+        how long its upstream has answered nothing while a call waited on it. ``{"stalled": True}`` while it cannot be
+        reached; None where it has no such route."""
         if self._stall_client is None:
             self._stall_client = setup_admin_clients(self._client_config)[0]
         try:
             response = await self._stall_client.get("/stall", timeout=httpx.Timeout(STALL_CHECK_TIMEOUT_S))
         except httpx.HTTPError:
-            return True
+            return {"stalled": True}
         if response.status_code == 404:
             return None
         if response.status_code != 200:
-            return True
-        return bool(response.json().get("stalled"))
+            return {"stalled": True}
+        return response.json()
+
+    async def inference_stalled(self) -> bool | None:
+        """Whether the endpoint says it is stalled: True while it does, or while it cannot be reached; None where it
+        has no way to say."""
+        state = await self.stall_state()
+        return None if state is None else bool(state.get("stalled"))
 
     async def score(self, token_ids: list[int]) -> list[float]:
         """Prefill-score ``token_ids`` under this endpoint's model (one logprob
