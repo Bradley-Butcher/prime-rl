@@ -107,6 +107,10 @@ from prime_rl.utils.utils import clean_exit
 # shutdown wedges (env-worker-pool ZMQ recv, vLLM admin aclose, etc)
 SHUTDOWN_TIMEOUT_S = 300
 
+# Upper bound on holding train batch shipping during an online eval epoch so a
+# stuck or abandoned eval can never deadlock training indefinitely.
+EVAL_HOLD_TIMEOUT_S = 3600.0
+
 # Maximum shipped batches that inference has not applied the policy for yet. The
 # dispatcher is paused via ``update_dispatch_gate`` once this is exceeded; resumed
 # when the watcher advances ``policy.version``. Shipping itself is paced by the
@@ -927,6 +931,7 @@ class Orchestrator:
         # Hold train batch shipping while online eval epochs are active so inference weights stay
         # pinned to this policy version across multi-rollout eval epochs (e.g. group_size > 1).
         self.train_sink.hold_shipping = True
+        self.train_sink.hold_shipping_until = time.monotonic() + EVAL_HOLD_TIMEOUT_S
         reason = f"eval was triggered at step {step}"
         self.dispatcher.switch_mode(DispatcherMode.PREFER_EVAL, reason=reason)
         now = time.perf_counter()
@@ -1110,6 +1115,7 @@ class Orchestrator:
         queued train batch."""
         if not self.eval_triggered_at and self.train_sink.hold_shipping:
             self.train_sink.hold_shipping = False
+            self.train_sink.hold_shipping_until = None
             if not self.draining and not self.stopped.is_set():
                 await self.handle_train_result(await self.train_sink.take_batch())
 

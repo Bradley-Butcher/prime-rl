@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator
 
@@ -165,8 +166,9 @@ class TrainSink(Reconfigurable):
         # batch is cut until that one has shipped.
         self.shipping = False
         # Set while an online eval epoch is active: hold cutting/shipping train batches so
-        # policy weights stay pinned for the duration of the eval.
+        # policy weights stay pinned for the duration of the eval (bounded by hold_shipping_until).
         self.hold_shipping = False
+        self.hold_shipping_until: float | None = None
         self.downsample_rngs: dict[str, random.Random] = {}
         # Trained down-sampled groups' rollouts by whether they were kept, for the trace stream.
         self.kept_marks: dict[str, bool] = {}
@@ -272,6 +274,10 @@ class TrainSink(Reconfigurable):
         """Sweep stale queued traces, then cut a batch if the survivors still
         meet the threshold."""
         self._drop_stale()
+        if self.hold_shipping and self.hold_shipping_until is not None and time.monotonic() >= self.hold_shipping_until:
+            get_logger().warning("Eval train-shipping hold expired; resuming train batch shipping")
+            self.hold_shipping = False
+            self.hold_shipping_until = None
         if self.shipping or self.hold_shipping:
             return None
         return await self.process_batch() if len(self.pending_batch) >= self.batch_size else None

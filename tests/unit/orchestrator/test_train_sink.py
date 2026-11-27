@@ -533,3 +533,15 @@ def test_hold_shipping_defers_batch_cut_until_released():
         assert batch is not None and len(batch.samples) == 2
 
     asyncio.run(run())
+
+
+def test_hold_shipping_expires_after_deadline():
+    async def run():
+        s = sink(batch_size=1)
+        s.hold_shipping = True
+        s.hold_shipping_until = 0.0  # Already past time.monotonic().
+        batch = await s.add(episode([trace()], group="g1"))
+        assert batch is not None and len(batch.samples) == 1
+        assert not s.hold_shipping and s.hold_shipping_until is None
+
+    asyncio.run(run())
