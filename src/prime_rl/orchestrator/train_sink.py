@@ -24,7 +24,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.control.types import ConfigUpdate, Reconfigurable
 from prime_rl.orchestrator.algo.base import iter_trainable_traces
 from prime_rl.orchestrator.algo.routing import stamp_loss_routing
-from prime_rl.orchestrator.downsample import downsample_record, max_variance_subset
+from prime_rl.orchestrator.downsample import downsample_record, max_variance_subset, trained_advantage
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.metrics import RolloutWindow, TrainEpisodes
 from prime_rl.orchestrator.trajectories import iter_trainable_branches, trace_to_samples
@@ -140,11 +140,14 @@ class TrainSink(Reconfigurable):
         batch_size: int,
         on_result: Callable[..., bool] | None = None,
         on_groups_closed: Callable[[Iterable[str]], None] | None = None,
+        on_groups_reopened: Callable[[Iterable[str]], None] | None = None,
         group_size: Callable[[str], int | None] | None = None,
         on_downsample: Callable[[dict], None] | None = None,
     ) -> None:
         """``on_groups_closed`` receives the ids of every group that closes: a group
         that finalized without anything to ship, or one whose batch shipped (`shipped`).
+        ``on_groups_reopened`` receives the ids of groups voided by an inference stall so
+        their tasks re-run instead of being lost.
         ``group_size`` returns the size a group was drawn with, or None if unknown; an
         unknown group takes its env's current group size."""
         self.config = config
@@ -154,12 +157,16 @@ class TrainSink(Reconfigurable):
         self.batch_size = batch_size
         self.on_result = on_result
         self.on_groups_closed = on_groups_closed
+        self.on_groups_reopened = on_groups_reopened
         self.group_size = group_size
         # Records every rollout of a down-sampled group: whether it was kept and the advantage it trains with.
         self.on_downsample = on_downsample
         # Set while the consumer ships a batch: groups keep queueing, but no
         # batch is cut until that one has shipped.
         self.shipping = False
+        # Set while an online eval epoch is active: hold cutting/shipping train batches so
+        # policy weights stay pinned for the duration of the eval.
+        self.hold_shipping = False
         self.downsample_rngs: dict[str, random.Random] = {}
         # Trained down-sampled groups' rollouts by whether they were kept, for the trace stream.
         self.kept_marks: dict[str, bool] = {}
@@ -265,7 +272,7 @@ class TrainSink(Reconfigurable):
         """Sweep stale queued traces, then cut a batch if the survivors still
         meet the threshold."""
         self._drop_stale()
-        if self.shipping:
+        if self.shipping or self.hold_shipping:
             return None
         return await self.process_batch() if len(self.pending_batch) >= self.batch_size else None
 
@@ -363,7 +370,9 @@ class TrainSink(Reconfigurable):
         downsampled = getattr(env.config, "downsample", None) is not None
         voiding = ("shutdown", "stall", "overload") if downsampled else ("shutdown", "stall")
         if cancellation is not None and cancellation.reason in voiding:
-            if cancellation.reason != "shutdown":
+            if cancellation.reason == "stall" and self.on_groups_reopened is not None:
+                self.on_groups_reopened([group_id])
+            elif cancellation.reason != "shutdown":
                 self._close([group_id])
             self._record_group(group, failures, cancellation, env_name, admitted=False, cancelled=group)
             self._record_zero_output(group, [], n_owed, reason="cancelled")
@@ -545,8 +554,9 @@ class TrainSink(Reconfigurable):
             return None
         if env_name not in self.downsample_rngs:
             self.downsample_rngs[env_name] = random.Random(config.seed)
-        rewards = [trace.reward for trace in survivors]
-        kept = max_variance_subset(rewards, env.config.group_size, self.downsample_rngs[env_name])
+        advantages = [trained_advantage(trace) for trace in survivors]
+        scores = advantages if all(a is not None for a in advantages) else [trace.reward for trace in survivors]
+        kept = max_variance_subset(scores, env.config.group_size, self.downsample_rngs[env_name])
         return [survivors[index] for index in kept]
 
     async def _score_kept(self, env, group: list[vf.Episode], kept: list[vf.Trace]) -> None:

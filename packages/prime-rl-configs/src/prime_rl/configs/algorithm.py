@@ -127,8 +127,8 @@ class UnfinishedRewardConfig(BaseConfig):
     its agent's deadline stopped that trains as a failure (``timeouts_as_failures``)."""
 
     reward: float | None = Field(None, allow_inf_nan=False)
-    """The reward such a rollout trains with in place of its own, whether or not the env passed it. None keeps the
-    env's score for a cut-off rollout and 0 for a timed-out one."""
+    """The reward an unfinished failure (``reward <= 0``) trains with in place of its own; a cut-off rollout the env
+    passed keeps its pass. None keeps the env's score for a cut-off rollout and 0 for a timed-out one."""
 
     only_with_pass: bool = False
     """Apply ``reward`` only in a group with a finished pass (a rollout the env passed that no limit cut off). In a

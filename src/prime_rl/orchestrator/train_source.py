@@ -90,6 +90,13 @@ class TrainSource(Reconfigurable):
         for group_id in group_ids:
             self.open_groups.pop(group_id, None)
 
+    def reopen_groups(self, group_ids: Iterable[str]) -> None:
+        """Re-queue open groups dropped by an external interruption (such as an inference stall) so they re-run
+        before new tasks are drawn."""
+        groups = [group for group_id in group_ids if (group := self.open_groups.pop(group_id, None)) is not None]
+        if groups:
+            self._reopen(groups, reason="after stall")
+
     def on_result(self, group: list[vf.Episode], kept_trace_ids: set[str] | None = None) -> bool:
         """Report a finalized group and return whether it should train. A down-sampled group reports every rollout,
         with ``kept_trace_ids`` the ones it trains on if admitted."""
@@ -151,9 +158,12 @@ class TrainSource(Reconfigurable):
             get_logger().info(f"Dropped the checkpointed curriculum state of env {name}, which is no longer configured")
         self._reopen(state_dict.get("open_groups", []))
 
-    def _reopen(self, open_groups: list[tuple[str, str] | tuple[str, str, int]]) -> None:
+    def _reopen(
+        self, open_groups: list[tuple[str, str] | tuple[str, str, int]], *, reason: str = "from the checkpoint"
+    ) -> None:
         removed_env: Counter[str] = Counter()
         removed_task: Counter[str] = Counter()
+        added = 0
         for group in open_groups:
             env_name, task_key = group[:2]
             if env_name not in self.curricula:
@@ -163,6 +173,7 @@ class TrainSource(Reconfigurable):
             else:
                 group_size = group[2] if len(group) == 3 else self.envs_by_name[env_name].config.group_size
                 self.reopened.append((env_name, task, group_size))
+                added += 1
         for name, count in sorted(removed_env.items()):
             get_logger().info(f"Dropped {count} open group(s) of env {name}, which is no longer configured")
         for name, count in sorted(removed_task.items()):
@@ -170,5 +181,5 @@ class TrainSource(Reconfigurable):
                 get_logger().info(f"Dropped {count} open group(s) of env {name}: a streaming taskset cannot re-run")
             else:
                 get_logger().info(f"Dropped {count} open group(s) of env {name} whose task is no longer in the taskset")
-        if self.reopened:
-            get_logger().info(f"Re-running {len(self.reopened)} open group(s) from the checkpoint")
+        if added:
+            get_logger().info(f"Re-running {added} open group(s) {reason}")
