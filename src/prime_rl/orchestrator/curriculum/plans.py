@@ -677,6 +677,9 @@ class Plans:
             except PlanError as error:
                 get_logger().warning(f"Setting plan {stored.id} for {key} aside: {error}")
                 del self.plans[key]
+        if self.plans:
+            keys = sorted(self.plans, key=lambda key: (key != "default", key if key != "default" else 0))
+            get_logger().info(f"Restored {len(self.plans)} curriculum plan(s) from {self.plans_path} (steps={keys})")
 
     def _load_replay(self, path: Path) -> dict[int, list[PlanTask]]:
         """Each step's dispatched Tasks in a dispatch record, in order."""

@@ -137,6 +137,11 @@ class Shaping:
                 self._log(action="reset")
         else:
             self.changes = _changes(events)
+            if self.changes:
+                get_logger().info(
+                    f"Restored {len(self.changes)} shaping change(s) from {self.path} "
+                    f"(steps={[stored.step for stored in self.changes]})"
+                )
         for default in self.defaults.values():  # Each step's setting, so that a bad record fails here, not mid-run.
             for index in range(len(self.changes)):
                 _resolve(default, self.changes[: index + 1])

@@ -65,6 +65,34 @@ def test_a_stall_drop_voids_the_group_and_closes_it():
     asyncio.run(run())
 
 
+def test_a_stall_drop_reopens_the_group_on_train_source():
+    async def run():
+        env = FakeEnv()
+        envs = Envs([env])
+        source = TrainSource(envs)
+        req = source.next_task(step=1)
+        closed = []
+        s = TrainSink(
+            OrchestratorConfig(batch_size=4),
+            tokenizer=None,
+            train_envs=envs,
+            progress=Progress(),
+            batch_size=4,
+            on_result=source.on_result,
+            on_groups_closed=closed.extend,
+            on_groups_reopened=source.reopen_groups,
+            group_size=source.group_size,
+        )
+        assert req.group_id in source.open_groups
+        assert await s.cancel(GroupCancellation("train", "env", req.group_id, 1, 4, "stall")) is None
+        assert req.group_id not in source.open_groups
+        assert closed == []
+        rerun = source.next_task(step=1)
+        assert rerun.env_name == req.env_name and rerun.task.key == req.task.key and rerun.rollouts == req.rollouts
+
+    asyncio.run(run())
+
+
 class FakeEnv:
     """Two Tasks of four rollouts each; Task 1's first rollout met a stall (``met="stall"``) or ran out its deadline
     (``met="timeout"``), the rest are ordinary."""

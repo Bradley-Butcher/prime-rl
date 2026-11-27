@@ -82,16 +82,16 @@ def advantages(algorithm: GRPOAlgorithm, group: list[vf.Episode]) -> list[float]
 
 
 def mixed_group(step: int = 1, group: str = "g") -> list[vf.Episode]:
-    """Two passes, one with 4 stuck calls; a rollout the turn cap cut off that Ocean passed; one that timed out."""
+    """Two passes, one with 4 stuck calls; a failed rollout the turn cap cut off; one that timed out."""
     return [
         rollout(1.0, step=step, group=group),
         rollout(1.0, stuck=4, step=step, group=group),
-        rollout(1.0, stop="max_turns", step=step, group=group),
+        rollout(0.0, stop="max_turns", step=step, group=group),
         rollout(1.0, stop="agent_timeout", step=step, group=group),
     ]
 
 
-UNSHAPED = [0.25, 0.25, 0.25, -0.75]  # rewards 1, 1, 1 and the timeout's 0
+UNSHAPED = [0.5, 0.5, -0.5, -0.5]  # rewards 1, 1, 0 and the timeout's 0
 SHAPED = [1.025, 0.925, -0.975, -0.975]  # rewards 1, 0.9, -1, -1
 
 
@@ -184,15 +184,16 @@ def test_a_change_applies_from_its_step_on_and_never_to_groups_already_dispatche
 
     assert change["step"] == 2 and change["state"] == "pending"
     assert advantages(algorithm, in_flight) == pytest.approx(UNSHAPED)
-    assert advantages(algorithm, mixed_group(step=2, group="at-2")) == pytest.approx(SHAPED)
+    at_2 = mixed_group(step=2, group="at-2")
+    assert advantages(algorithm, at_2) == pytest.approx(SHAPED)
     assert advantages(algorithm, mixed_group(step=7, group="at-7")) == pytest.approx(SHAPED)
 
     post(shaping, 4, unfinished={"reward": None})  # unfinished rollouts keep the env's score again from step 4
     at_4 = advantages(algorithm, mixed_group(step=4, group="at-4"))
-    assert at_4 == pytest.approx([0.275, 0.175, 0.275, -0.725])  # rewards 1, 0.9, 1 and the timeout's 0
+    assert at_4 == pytest.approx([0.525, 0.425, -0.475, -0.475])  # rewards 1, 0.9, 0 and the timeout's 0
 
     source.on_result(in_flight)
-    source.on_result(mixed_group(step=2, group="at-2"))
+    source.on_result(at_2)
     recorded = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
     shaped = {
         **DEFAULT,
@@ -323,38 +324,31 @@ def test_one_pass_or_passes_of_equal_turns_are_unchanged(shaping, rewards, turns
 
 
 @pytest.mark.parametrize("unfinished", [-1.0, None])
-def test_the_turn_penalty_multiplies_the_stuck_one_and_leaves_unfinished_rollouts_to_their_lever(unfinished):
+def test_the_turn_penalty_multiplies_the_stuck_one_and_leaves_unfinished_failures_to_their_lever(unfinished):
     shaping = {"stuck": {"per_call": 0.05}, "unfinished": {"reward": unfinished}, "pass_turns": {"weight": 0.3}}
     group = [
         rollout(1.0, turns=2),
         rollout(1.0, turns=4, stuck=4),
         rollout(1.0, turns=3, stuck=4),
-        rollout(1.0, turns=10, stop="max_turns"),  # the turn cap cut it off; the env passed it
+        rollout(1.0, turns=10, stop="max_turns"),  # the turn cap cut it off, but the env verified a pass
+        rollout(0.0, turns=10, stop="max_turns"),  # unfinished failure
         rollout(1.0, turns=1, stop="agent_timeout"),  # a failure scored 0
         rollout(0.0, turns=1),
     ]
 
     stuck_and_turns = ("stuck", "pass_turns")
-    if unfinished is not None:
-        # The unfinished lever takes the cut-off pass, so the passes span 2 to 4 turns; the stuck cut is 0.9.
-        assert shaped(shaping, group) == [
-            (1.0, ()),
-            (pytest.approx(0.9 * 0.7), stuck_and_turns),
-            (pytest.approx(0.9 * 0.85), stuck_and_turns),
-            (-1.0, ("unfinished",)),
-            (-1.0, ("unfinished",)),
-            (0.0, ()),
-        ]
-    else:
-        # The cut-off rollout keeps the env's pass, and is the slowest of passes spanning 2 to 10 turns.
-        assert shaped(shaping, group) == [
-            (1.0, ()),
-            (pytest.approx(0.9 * (1 - 0.3 * 2 / 8)), stuck_and_turns),
-            (pytest.approx(0.9 * (1 - 0.3 / 8)), stuck_and_turns),
-            (pytest.approx(0.7), ("pass_turns",)),
-            (0.0, ()),
-            (0.0, ()),
-        ]
+    # The cut-off pass always keeps its pass (slowest of passes spanning 2 to 10 turns).
+    # Only unfinished failures (failed max_turns and agent_timeout) take unfinished.reward.
+    unfinished_entry = (-1.0, ("unfinished",)) if unfinished is not None else (0.0, ())
+    assert shaped(shaping, group) == [
+        (1.0, ()),
+        (pytest.approx(0.9 * (1 - 0.3 * 2 / 8)), stuck_and_turns),
+        (pytest.approx(0.9 * (1 - 0.3 / 8)), stuck_and_turns),
+        (pytest.approx(0.7), ("pass_turns",)),
+        unfinished_entry,
+        unfinished_entry,
+        (0.0, ()),
+    ]
 
 
 @pytest.mark.parametrize("gate_on_raw", [True, False])
@@ -454,7 +448,9 @@ def test_the_turn_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tm
 
     traces = {episode.traces[0].id: episode.traces[0] for episode in group}
     kept = [traces[trace_id] for trace_id in sink.pending_batch]
-    assert len(kept) == 8 and sum(trace.reward for trace in kept) == 4  # 4 of the 6 passes, at random, 4 failures
+    # Shaped advantages [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0, ...] have max variance at top-3 fastest passes + 5 failures.
+    assert len(kept) == 8 and sum(trace.reward for trace in kept) == 3
+    assert sorted(trace.num_turns for trace in kept if trace.reward) == [2, 4, 6]
     if baseline == "all":
         # Each pass against all six passes' 2 to 12 turns, minus the mean of all twelve, (1 + 0.9 + ... + 0.5) / 12.
         rewards = {trace.id: 1 - 0.5 * (trace.num_turns - 2) / 10 if trace.reward else 0.0 for trace in kept}
@@ -479,7 +475,7 @@ def test_the_turn_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tm
         5,
         {"weight": 0.5, "free": 0, "scale": None, "gate_on_raw": True},
     )
-    assert mixed["kept"] == {"rollouts": 8, "reward": 0.5, "successes": 4}
+    assert mixed["kept"] == {"rollouts": 8, "reward": 0.375, "successes": 3}
     assert (uniform["pass_turns_penalized"], uniform["kept"]) == (11, None)
     records = [json.loads(line) for line in (tmp_path / "downsample.jsonl").read_text().splitlines()]
     assert [record["admitted"] for record in records] == [True, False]
@@ -587,9 +583,62 @@ def test_unfinished_only_with_a_pass_leaves_a_group_without_one_to_the_env_s_sco
     # A cut-off pass is not a finished one, so it keeps its pass where no finished rollout passed.
     cut_pass = [rollout(0.0), rollout(1.0, turns=9, stop="max_turns")]
     assert shaped(on, cut_pass) == [(0.0, ()), (1.0, ())]
-    # A group with a finished pass scores its unfinished rollouts as before.
-    with_pass = [rollout(1.0), rollout(0.0), rollout(1.0, turns=9, stop="max_turns")]
-    assert shaped(on, with_pass) == shaped(off, with_pass) == [(1.0, ()), (0.0, ()), (-0.25, ("unfinished",))]
+    # A group with a finished pass penalizes unfinished failures, while a verified cut-off pass keeps its pass.
+    with_pass = [
+        rollout(1.0),
+        rollout(0.0),
+        rollout(0.0, turns=9, stop="max_turns"),
+        rollout(1.0, turns=9, stop="max_turns"),
+    ]
+    assert (
+        shaped(on, with_pass) == shaped(off, with_pass) == [(1.0, ()), (0.0, ()), (-0.25, ("unfinished",)), (1.0, ())]
+    )
+
+
+def test_downsample_uses_shaped_advantages_to_keep_turn_extremes_on_all_pass_groups(tmp_path):
+    """When gate_on_raw=False admits an all-pass group shaped by pass_turns, PODS picks the fastest and slowest passes
+    (guaranteed mixed advantages) rather than a random subset of raw 1.0 rewards."""
+    tasks = [vf.Task(vf.WireTaskData(idx=0, id="a-0", prompt="a"))]
+    curriculum = CurriculumConfig(gates={"zero_advantage": AdvRangeGateConfig()})
+    env = SimpleNamespace(
+        name="a",
+        tasks=iter(tasks),
+        num_tasks=1,
+        config=SimpleNamespace(ratio=1.0, group_size=8, rollouts_per_task=12, curriculum=curriculum),
+    )
+    source = TrainSource([env])
+    source.plans = Plans(source, tmp_path, resume_step=None)
+    algorithm = GRPOAlgorithm(
+        GRPOAlgoConfig(shaping={"pass_turns": {"weight": 0.5, "gate_on_raw": False}}),
+        None,
+    )
+    config = SimpleNamespace(
+        group_size=8, rollouts_per_task=12, downsample=DownsampleConfig(rollouts=12, baseline="kept")
+    )
+    sink = TrainSink(
+        OrchestratorConfig(batch_size=100),
+        tokenizer=None,
+        train_envs=SimpleNamespace(
+            get=lambda name: SimpleNamespace(
+                config=config,
+                sampling_at=lambda step: vf.SamplingConfig(temperature=1.0),
+                requires_sampling_masks=False,
+                requires_sampler_logprobs=False,
+                algorithm=algorithm,
+            )
+        ),
+        progress=Progress(),
+        batch_size=100,
+        on_result=source.on_result,
+    )
+    group = [rollout(1.0, turns=t, group="all-pass") for t in range(2, 14)]
+    for ep in group:
+        asyncio.run(sink.add(ep))
+    traces = {ep.traces[0].id: ep.traces[0] for ep in group}
+    kept_turns = sorted(traces[tid].num_turns for tid in sink.pending_batch)
+    assert kept_turns == [2, 3, 4, 5, 10, 11, 12, 13]
+    advs = [trained_advantage(samples[0]) for samples in sink.pending_batch.values()]
+    assert any(a > 0 for a in advs) and any(a < 0 for a in advs)
 
 
 def test_the_turn_scale_and_unfinished_only_with_a_pass_are_set_live_and_recorded(tmp_path):

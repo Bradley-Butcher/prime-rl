@@ -107,6 +107,10 @@ from prime_rl.utils.utils import clean_exit
 # shutdown wedges (env-worker-pool ZMQ recv, vLLM admin aclose, etc)
 SHUTDOWN_TIMEOUT_S = 300
 
+# Upper bound on holding train batch shipping during an online eval epoch so a
+# stuck or abandoned eval can never deadlock training indefinitely.
+EVAL_HOLD_TIMEOUT_S = 3600.0
+
 # Maximum shipped batches that inference has not applied the policy for yet. The
 # dispatcher is paused via ``update_dispatch_gate`` once this is exceeded; resumed
 # when the watcher advances ``policy.version``. Shipping itself is paced by the
@@ -390,6 +394,7 @@ class Orchestrator:
             batch_size=config.batch_size,
             on_result=self.train_source.on_result,
             on_groups_closed=self.train_source.close_groups,
+            on_groups_reopened=self.train_source.reopen_groups,
             group_size=self.train_source.group_size,
             on_downsample=self.train_source.plans.record_downsample,
         )
@@ -923,6 +928,10 @@ class Orchestrator:
         if not fired:
             return
         self.eval_triggered_steps.add(step)
+        # Hold train batch shipping while online eval epochs are active so inference weights stay
+        # pinned to this policy version across multi-rollout eval epochs (e.g. group_size > 1).
+        self.train_sink.hold_shipping = True
+        self.train_sink.hold_shipping_until = time.monotonic() + EVAL_HOLD_TIMEOUT_S
         reason = f"eval was triggered at step {step}"
         self.dispatcher.switch_mode(DispatcherMode.PREFER_EVAL, reason=reason)
         now = time.perf_counter()
@@ -1053,6 +1062,8 @@ class Orchestrator:
         worker threads."""
         if not batch.episodes and not batch.failures:
             get_logger().warning(f"Eval @ step={batch.step} env={batch.env_name}: no attempts returned, skipping log")
+            self.eval_triggered_at.pop((batch.env_name, batch.step), None)
+            await self._maybe_release_eval_hold()
             return
 
         # The non-errored subset is logged on epoch completion (multiple eval envs share the
@@ -1071,6 +1082,10 @@ class Orchestrator:
         policy_versions = {span.start for span in policy_spans if span is not None}
         policy_versions.update(failure.policy_version for failure in batch.failures)
         policy_version = min(policy_versions)
+        if len(policy_versions) > 1:
+            get_logger().warning(
+                f"Eval {batch.env_name} step {batch.step} mixed policy versions {sorted(policy_versions)}"
+            )
 
         def epoch_metrics() -> dict[str, float]:
             # Episode metrics over {all,effective} (eval batches are per-env, so no `agg` axis).
@@ -1093,6 +1108,16 @@ class Orchestrator:
         triggered_at = self.eval_triggered_at.pop((batch.env_name, batch.step), None)
         elapsed = (time.perf_counter() - triggered_at) if triggered_at is not None else 0.0
         await asyncio.to_thread(self.log_eval_batch, batch, policy_version=policy_version, elapsed=elapsed)
+        await self._maybe_release_eval_hold()
+
+    async def _maybe_release_eval_hold(self) -> None:
+        """Release the train-shipping hold once all active eval epochs have finished and flush any
+        queued train batch."""
+        if not self.eval_triggered_at and self.train_sink.hold_shipping:
+            self.train_sink.hold_shipping = False
+            self.train_sink.hold_shipping_until = None
+            if not self.draining and not self.stopped.is_set():
+                await self.handle_train_result(await self.train_sink.take_batch())
 
     def log_eval_batch(self, batch: EvalBatch, *, policy_version: int, elapsed: float) -> None:
         """Success line — quality metrics over the effective set, error rate over the full returned

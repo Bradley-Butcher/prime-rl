@@ -518,3 +518,30 @@ def test_with_timeouts_as_failures_errors_and_timeouts_without_a_reply_are_still
         assert all(t.has_error for t in (task_error, never_replied, setup_timeout))
 
     asyncio.run(run())
+
+
+def test_hold_shipping_defers_batch_cut_until_released():
+    async def run():
+        s = sink(batch_size=2)
+        s.hold_shipping = True
+        assert await s.add(episode([trace()], group="g1")) is None
+        assert await s.add(episode([trace()], group="g2")) is None
+        assert len(s.pending_batch) == 2
+        assert await s.take_batch() is None
+        s.hold_shipping = False
+        batch = await s.take_batch()
+        assert batch is not None and len(batch.samples) == 2
+
+    asyncio.run(run())
+
+
+def test_hold_shipping_expires_after_deadline():
+    async def run():
+        s = sink(batch_size=1)
+        s.hold_shipping = True
+        s.hold_shipping_until = 0.0  # Already past time.monotonic().
+        batch = await s.add(episode([trace()], group="g1"))
+        assert batch is not None and len(batch.samples) == 1
+        assert not s.hold_shipping and s.hold_shipping_until is None
+
+    asyncio.run(run())
