@@ -52,6 +52,7 @@ class UnfinishedChange(BaseModel):
 
     reward: float | None = None
     """``null`` keeps the env's scores again."""
+    only_with_pass: bool | None = None
 
 
 class PassTurnsChange(BaseModel):
@@ -59,6 +60,8 @@ class PassTurnsChange(BaseModel):
 
     weight: float | None = None
     """0 turns the penalty off."""
+    scale: int | None = None
+    """``null`` scales the cut by the group's spread again."""
     gate_on_raw: bool | None = None
 
 

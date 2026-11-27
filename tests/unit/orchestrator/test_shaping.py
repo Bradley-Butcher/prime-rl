@@ -194,7 +194,11 @@ def test_a_change_applies_from_its_step_on_and_never_to_groups_already_dispatche
     source.on_result(in_flight)
     source.on_result(mixed_group(step=2, group="at-2"))
     recorded = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
-    shaped = {**DEFAULT, "stuck": dict(DEFAULT["stuck"], per_call=0.05), "unfinished": {"reward": -1.0}}
+    shaped = {
+        **DEFAULT,
+        "stuck": dict(DEFAULT["stuck"], per_call=0.05),
+        "unfinished": dict(DEFAULT["unfinished"], reward=-1.0),
+    }
     assert [(line["shaping"], line["stuck_penalized"], line["unfinished_scored"]) for line in recorded] == [
         (DEFAULT, 0, 0),
         (shaped, 1, 2),
@@ -473,7 +477,7 @@ def test_the_turn_penalty_ranges_over_the_rollouts_the_baseline_is_taken_over(tm
     mixed, uniform = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
     assert (mixed["pass_turns_penalized"], mixed["shaping"]["pass_turns"]) == (
         5,
-        {"weight": 0.5, "free": 0, "gate_on_raw": True},
+        {"weight": 0.5, "free": 0, "scale": None, "gate_on_raw": True},
     )
     assert mixed["kept"] == {"rollouts": 8, "reward": 0.5, "successes": 4}
     assert (uniform["pass_turns_penalized"], uniform["kept"]) == (11, None)
@@ -499,7 +503,7 @@ def test_the_turn_penalty_is_set_live_from_a_step_on_as_the_other_levers_are(tmp
     posted = client.post("/v1/shaping", json={"step": "next", "author": "me", "note": "slow passes", **TURNS_ON})
     assert posted.status_code == 200
     assert (posted.json()["step"], posted.json()["change"], posted.json()["state"]) == (2, TURNS_ON, "pending")
-    on = {"weight": 0.2, "free": 0, "gate_on_raw": True}
+    on = {"weight": 0.2, "free": 0, "scale": None, "gate_on_raw": True}
     assert posted.json()["shaping"] == [{"envs": ["a"], **DEFAULT, "pass_turns": on}]
     source.next_task(step=2)
     source.next_task(step=3)
@@ -546,3 +550,68 @@ def test_a_resume_and_a_replay_read_the_turn_penalty_back(tmp_path):
     assert advantages(resumed_algorithm, turns_group(step=4)) == pytest.approx(PENALIZED)
     assert advantages(resumed_algorithm, turns_group(step=5)) == pytest.approx(UNPENALIZED)
     assert advantages(replayed_algorithm, turns_group(step=2)) == pytest.approx(PENALIZED)
+
+
+def test_an_absolute_turn_scale_cuts_a_turn_by_the_same_share_whatever_the_group_s_spread():
+    relative = PassTurnsPenaltyConfig(weight=0.5, free=2)
+    absolute = PassTurnsPenaltyConfig(weight=0.5, free=2, scale=8)
+    # Passes at 7, 9 and 10 turns: by the group's spread, the one turn past 9 takes the whole weight; by turns, 1/8.
+    assert [relative.factor(count, 7, 10) for count in (7, 9, 10)] == pytest.approx([1, 1, 0.5])
+    assert [absolute.factor(count, 7, 10) for count in (7, 9, 10)] == pytest.approx([1, 1, 1 - 0.5 / 8])
+    # A pass far past the quickest still loses the whole weight, and no more.
+    assert absolute.factor(30, 7, 30) == pytest.approx(0.5)
+    assert absolute.factor(13, 7, 30) == pytest.approx(1 - 0.5 * 4 / 8)
+    # One pass, or passes within free of the quickest, are unchanged.
+    group = [rollout(1.0, turns=7), rollout(1.0, turns=9), rollout(1.0, turns=10), rollout(0.0, turns=3)]
+    assert shaped({"pass_turns": {"weight": 0.5, "free": 2, "scale": 8}}, group) == [
+        (1.0, ()),
+        (1.0, ()),
+        (pytest.approx(1 - 0.5 / 8), ("pass_turns",)),
+        (0.0, ()),
+    ]
+
+
+def test_unfinished_only_with_a_pass_leaves_a_group_without_one_to_the_env_s_scores():
+    on = {"unfinished": {"reward": -0.25, "only_with_pass": True}}
+    off = {"unfinished": {"reward": -0.25}}
+    no_pass = [rollout(0.0), rollout(0.0), rollout(0.0, turns=5, stop="max_turns"), rollout(1.0, stop="agent_timeout")]
+    # Without the switch, the finished failures beat the rollouts still looking: a give-up trains as better.
+    assert [reward for reward, _ in shaped(off, no_pass)] == [0.0, 0.0, -0.25, -0.25]
+    algorithm = GRPOAlgorithm(GRPOAlgoConfig(timeouts_as_failures=True, shaping=off), None)
+    assert advantages(algorithm, no_pass)[0] > 0
+    # With it, a group without a finished pass keeps the env's scores: uniform, so no advantage for stopping.
+    no_pass = [rollout(0.0), rollout(0.0), rollout(0.0, turns=5, stop="max_turns"), rollout(1.0, stop="agent_timeout")]
+    assert shaped(on, no_pass) == [(0.0, ()), (0.0, ()), (0.0, ()), (0.0, ())]
+    algorithm = GRPOAlgorithm(GRPOAlgoConfig(timeouts_as_failures=True, shaping=on), None)
+    assert advantages(algorithm, no_pass) == pytest.approx([0.0, 0.0, 0.0, 0.0])
+    # A cut-off pass is not a finished one, so it keeps its pass where no finished rollout passed.
+    cut_pass = [rollout(0.0), rollout(1.0, turns=9, stop="max_turns")]
+    assert shaped(on, cut_pass) == [(0.0, ()), (1.0, ())]
+    # A group with a finished pass scores its unfinished rollouts as before.
+    with_pass = [rollout(1.0), rollout(0.0), rollout(1.0, turns=9, stop="max_turns")]
+    assert shaped(on, with_pass) == shaped(off, with_pass) == [(1.0, ()), (0.0, ()), (-0.25, ("unfinished",))]
+
+
+def test_the_turn_scale_and_unfinished_only_with_a_pass_are_set_live_and_recorded(tmp_path):
+    source, algorithm, shaping = live(tmp_path)
+    client = TestClient(
+        create_app(Controller(requires_step=True), routers=[plan_router(source.plans, shaping=shaping)])
+    )
+    source.next_task(step=1)
+    for bad in ({"pass_turns": {"scale": 0}}, {"unfinished": {"only_with_pass": None}}, {"unfinished": {"bogus": 1}}):
+        assert client.post("/v1/shaping", json={"step": 3, **bad}).status_code == 422, bad
+    change = {"pass_turns": {"weight": 0.5, "scale": 8}, "unfinished": {"reward": -0.25, "only_with_pass": True}}
+    posted = client.post("/v1/shaping", json={"step": "next", "author": "me", "note": "audit", **change})
+    assert posted.status_code == 200
+    [setting] = posted.json()["shaping"]
+    assert setting["pass_turns"]["scale"] == 8 and setting["unfinished"] == {"reward": -0.25, "only_with_pass": True}
+    back = client.post("/v1/shaping", json={"step": 5, "pass_turns": {"scale": None}})
+    assert back.status_code == 200 and back.json()["shaping"][0]["pass_turns"]["scale"] is None
+    source.next_task(step=2)
+    group = [rollout(0.0, step=2, group="at-2"), rollout(1.0, step=2, group="at-2", stop="agent_timeout")]
+    for episode in group:
+        algorithm.settle_timeouts(episode)
+    source.on_result(group)
+    [line] = [json.loads(line) for line in (tmp_path / "groups.jsonl").read_text().splitlines()]
+    assert line["shaping"]["pass_turns"]["scale"] == 8 and line["shaping"]["unfinished"]["only_with_pass"] is True
+    assert line["unfinished_scored"] == 0

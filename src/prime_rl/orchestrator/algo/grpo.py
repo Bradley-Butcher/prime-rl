@@ -59,15 +59,19 @@ def shape_rewards(
     """The reward GRPO's baseline and advantages take for each of a group's ``traces`` under ``shaping``, and the
     levers that changed it, of ``"unfinished"``, ``"stuck"`` and ``"pass_turns"``.
 
-    An unfinished rollout takes ``unfinished.reward`` when it is set. Every other rollout with a positive reward is a
-    pass: its reward is cut for its stuck calls (a trace without the stuck metric is not cut) and then, unless
-    ``pass_turns`` is False, for its turns relative to the group's other passes. A failure keeps its reward."""
+    An unfinished rollout takes ``unfinished.reward`` when it is set, and, with ``unfinished.only_with_pass``, the
+    group has a finished pass. Every other rollout with a positive reward is a pass: its reward is cut for its stuck
+    calls (a trace without the stuck metric is not cut) and then, unless ``pass_turns`` is False, for its turns relative
+    to the group's other passes. A failure keeps its reward."""
     rewards: list[float] = []
     levers: list[tuple[str, ...]] = []
     passes: list[int] = []
     stuck = shaping.stuck
+    unfinished = shaping.unfinished.reward is not None
+    if unfinished and shaping.unfinished.only_with_pass:
+        unfinished = any(trace.reward > 0 and not is_unfinished(trace) for trace in traces)
     for index, trace in enumerate(traces):
-        if shaping.unfinished.reward is not None and is_unfinished(trace):
+        if unfinished and is_unfinished(trace):
             rewards.append(shaping.unfinished.reward)
             levers.append(("unfinished",))
             continue

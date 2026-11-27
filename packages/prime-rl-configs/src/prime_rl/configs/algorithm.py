@@ -130,13 +130,20 @@ class UnfinishedRewardConfig(BaseConfig):
     """The reward such a rollout trains with in place of its own, whether or not the env passed it. None keeps the
     env's score for a cut-off rollout and 0 for a timed-out one."""
 
+    only_with_pass: bool = False
+    """Apply ``reward`` only in a group with a finished pass (a rollout the env passed that no limit cut off). In a
+    group without one, its unfinished rollouts keep the env's score, as with ``reward`` None: otherwise a negative
+    ``reward`` there ranks every finished failure, a wrong answer or a give-up, above the rollouts still looking, and
+    trains the group on stopping early alone. False applies ``reward`` in every group."""
+
 
 class PassTurnsPenaltyConfig(BaseConfig):
     """A cut in a pass's reward for its turns, relative to the other passes of its group. A pass is a rollout whose
     env reward is positive and that the ``unfinished`` lever leaves to the env's score; with ``t`` its model turns
     (``Trace.num_turns``, every sampled reply across the conversation) and ``t_min``, ``t_max`` the fewest and most of
     the group's passes, its reward is multiplied by ``1 - weight * (t - t_min) / (t_max - t_min)``: the quickest pass
-    keeps its reward, the slowest keeps ``1 - weight`` (``free`` gives turns of slack). A group with fewer than two passes, or whose passes took as
+    keeps its reward, the slowest keeps ``1 - weight`` (``free`` gives turns of slack). With ``scale``, the cut is by
+    turns, not by the group's spread: ``1 - weight * min(1, (t - t_min - free) / scale)``. A group with fewer than two passes, or whose passes took as
     many turns, is unchanged, and a failure is never changed, so there is nothing for a failure to gain. The group is
     the one the baseline is taken over: a down-sampled group's every rollout under ``baseline = "all"``, its kept
     rollouts under ``"kept"``. Off while ``weight`` is 0."""
@@ -150,6 +157,12 @@ class PassTurnsPenaltyConfig(BaseConfig):
     down: with it, a pass is cut by ``weight * (t - t_min - free) / (t_max - t_min - free)``, none within ``free`` of
     ``t_min``, and a group whose passes span ``free`` turns or fewer is unchanged."""
 
+    scale: int | None = Field(None, ge=1)
+    """Turns past ``t_min + free`` that take the whole ``weight``, so that a pass loses ``weight / scale`` a turn
+    whatever the rest of its group took. None scales the cut by the group's own spread, ``t_max - t_min - free``, so
+    that a group whose passes are close cuts its slowest by the whole weight for a single turn more than its quickest's
+    slack: one turn decides half a reward."""
+
     gate_on_raw: bool = True
     """The admission gates judge a group by its advantages without this penalty, so it never decides whether a group
     trains: a group of passes that differ only in turns stays uniform to the zero-advantage gate and is still rejected,
@@ -158,10 +171,13 @@ class PassTurnsPenaltyConfig(BaseConfig):
 
     def factor(self, turns: int, fewest: int, most: int) -> float:
         """What a pass's reward is multiplied by for ``turns``, its group's passes taking ``fewest`` to ``most``."""
+        over = max(0, turns - fewest - self.free)
+        if self.scale is not None:
+            return 1.0 - self.weight * min(1.0, over / self.scale)
         spread = most - fewest - self.free
         if spread <= 0:
             return 1.0
-        return 1.0 - self.weight * max(0, turns - fewest - self.free) / spread
+        return 1.0 - self.weight * over / spread
 
 
 class RewardShapingConfig(BaseConfig):
